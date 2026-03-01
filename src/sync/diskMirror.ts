@@ -1,9 +1,10 @@
-import { type App, TFile, normalizePath } from "obsidian";
+import { type App, MarkdownView, TFile, normalizePath } from "obsidian";
 import * as Y from "yjs";
 import type { VaultSync } from "./vaultSync";
 import type { EditorBindingManager } from "./editorBinding";
 import { ORIGIN_SEED } from "../types";
 import { ORIGIN_RESTORE } from "./snapshotClient";
+import type { TraceRecord } from "../debug/trace";
 
 /**
  * Handles writeback from Y.Text -> disk with:
@@ -15,6 +16,8 @@ import { ORIGIN_RESTORE } from "./snapshotClient";
 
 const DEBOUNCE_MS = 300;
 const DEBOUNCE_BURST_MS = 1000;
+const OPEN_FILE_IDLE_MS = 1500;
+const OPEN_FILE_ACTIVE_GRACE_MS = 1200;
 const SUPPRESS_MS = 500;
 const MAX_CONCURRENT_WRITES = 5;
 const BURST_THRESHOLD = 20;
@@ -27,33 +30,56 @@ const LOCAL_STRING_ORIGINS = new Set([
 ]);
 
 /**
- * Determine whether a Yjs transaction origin is "local" (should NOT trigger
- * a disk write). Remote sync from y-partykit uses `null` as the origin —
- * that's the only case we want to write to disk.
+ * Determine whether a Yjs transaction origin is local (should NOT trigger
+ * a disk write).
  *
- * Local origins include:
- *   - String origins: "vault-crdt-seed", "disk-sync", "snapshot-restore"
- *   - Object origins: y-codemirror.next passes its YSyncConfig instance
- *     as the transaction origin (not a string). Any non-null object origin
- *     is a local editor transaction.
+ * y-partykit applies remote updates with `transactionOrigin = provider`.
+ * y-codemirror applies local editor updates with `transactionOrigin = YSyncConfig`.
+ *
+ * We only treat provider-origin transactions as remote.
  */
-function isLocalOrigin(origin: unknown): boolean {
-	if (origin == null) return false; // null/undefined = remote sync
+function isLocalOrigin(origin: unknown, provider: unknown): boolean {
+	if (origin === provider) return false; // remote update from server
 	if (typeof origin === "string") return LOCAL_STRING_ORIGINS.has(origin);
-	// Non-null, non-string origin (e.g. y-codemirror's YSyncConfig object)
-	// is always a local editor transaction.
+	if (origin == null) return true; // local transact() without explicit origin
+	// Non-null object origins (e.g. y-codemirror's YSyncConfig) are local.
 	return true;
 }
 
+function describeOrigin(origin: unknown, provider: unknown): string {
+	if (origin === provider) return "provider-remote";
+	if (typeof origin === "string") return origin;
+	if (origin == null) return "null";
+	if (typeof origin === "object") {
+		const constructorName =
+			(origin as { constructor?: { name?: string } }).constructor?.name;
+		return constructorName || "object";
+	}
+	return String(origin);
+}
+
+interface SuppressionEntry {
+	kind: "write" | "delete";
+	expiresAt: number;
+	expectedBytes?: number;
+	expectedHash?: string;
+}
+
 export class DiskMirror {
-	private suppressedPaths = new Map<string, number>();
+	private suppressedPaths = new Map<string, SuppressionEntry>();
+	private openPaths = new Set<string>();
 
 	/** Deduped write queue. Order doesn't matter — deduplication does. */
 	private writeQueue = new Set<string>();
+	private forcedWritePaths = new Set<string>();
 	/** Debounce timers per path. */
 	private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	private openWriteTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	private pendingOpenWrites = new Set<string>();
 	/** True while the drain loop is running. */
 	private draining = false;
+	private drainPromise: Promise<void> | null = null;
+	private pathWriteLocks = new Map<string, Promise<void>>();
 
 	/** Per-file Y.Text observers. Only attached for open/active files. */
 	private textObservers = new Map<
@@ -70,6 +96,7 @@ export class DiskMirror {
 		private vaultSync: VaultSync,
 		private editorBindings: EditorBindingManager,
 		debug: boolean,
+		private trace?: TraceRecord,
 	) {
 		this.debug = debug;
 	}
@@ -81,16 +108,18 @@ export class DiskMirror {
 	startMapObservers(): void {
 		const pathObserver = (event: import("yjs").YMapEvent<string>) => {
 			event.changes.keys.forEach((change, path) => {
-				if (change.action === "add" || change.action === "update") {
-					if (!isLocalOrigin(event.transaction.origin)) {
-						this.log(`map: remote path added "${path}"`);
-						this.observeText(path);
-						this.scheduleWrite(path);
+					if (change.action === "add" || change.action === "update") {
+						if (!isLocalOrigin(event.transaction.origin, this.vaultSync.provider)) {
+							this.log(`map: remote path added "${path}"`);
+							if (this.openPaths.has(path)) {
+								this.observeText(path);
+							}
+							this.scheduleWrite(path);
+						}
 					}
-				}
 				if (change.action === "delete") {
 					this.unobserveText(path);
-					if (!isLocalOrigin(event.transaction.origin)) {
+					if (!isLocalOrigin(event.transaction.origin, this.vaultSync.provider)) {
 						void this.handleRemoteDelete(path);
 					}
 				}
@@ -107,7 +136,7 @@ export class DiskMirror {
 					const meta = this.vaultSync.meta.get(fileId);
 					if (
 						meta?.deleted &&
-						!isLocalOrigin(event.transaction.origin)
+						!isLocalOrigin(event.transaction.origin, this.vaultSync.provider)
 					) {
 						void this.handleRemoteDelete(meta.path);
 					}
@@ -130,7 +159,7 @@ export class DiskMirror {
 		// that doesn't already have a per-file observer (i.e. closed).
 		// ---------------------------------------------------------------
 		const afterTxnHandler = (txn: Y.Transaction) => {
-			if (isLocalOrigin(txn.origin)) return;
+			if (isLocalOrigin(txn.origin, this.vaultSync.provider)) return;
 
 			for (const [changedType] of txn.changed) {
 				if (!(changedType instanceof Y.Text)) continue;
@@ -145,8 +174,8 @@ export class DiskMirror {
 
 				const path = meta.path;
 
-				// Skip if this path already has a per-file text observer (open file)
-				if (this.textObservers.has(path)) continue;
+					// Skip if this path is already open (handled by per-file observer policy)
+					if (this.openPaths.has(path)) continue;
 
 				this.log(`afterTxn: remote content change to closed file "${path}"`);
 				this.scheduleWrite(path);
@@ -181,18 +210,42 @@ export class DiskMirror {
 	// -------------------------------------------------------------------
 
 	notifyFileOpened(path: string): void {
+		path = normalizePath(path);
+		this.trace?.("disk", "notifyFileOpened", { path });
+		this.openPaths.add(path);
+		if (this.writeQueue.delete(path)) {
+			this.forcedWritePaths.delete(path);
+			this.scheduleOpenWrite(path);
+		}
+		const closedTimer = this.debounceTimers.get(path);
+		if (closedTimer) {
+			clearTimeout(closedTimer);
+			this.debounceTimers.delete(path);
+			this.writeQueue.delete(path);
+			this.scheduleOpenWrite(path);
+		}
 		this.observeText(path);
 	}
 
 	notifyFileClosed(path: string): void {
+		path = normalizePath(path);
+		this.trace?.("disk", "notifyFileClosed", { path });
+		this.openPaths.delete(path);
 		// Flush any pending debounce for this path
 		const timer = this.debounceTimers.get(path);
 		if (timer) {
 			clearTimeout(timer);
 			this.debounceTimers.delete(path);
-			// Push to queue immediately
-			this.writeQueue.add(path);
-			this.kickDrain();
+			this.queueImmediateWrite(path, "file-closed");
+		}
+		const openTimer = this.openWriteTimers.get(path);
+		if (openTimer) {
+			clearTimeout(openTimer);
+			this.openWriteTimers.delete(path);
+			this.pendingOpenWrites.delete(path);
+			this.queueImmediateWrite(path, "file-closed");
+		} else if (this.pendingOpenWrites.delete(path)) {
+			this.queueImmediateWrite(path, "file-closed");
 		}
 		this.unobserveText(path);
 	}
@@ -204,8 +257,9 @@ export class DiskMirror {
 		if (!ytext) return;
 
 		const handler = (_event: import("yjs").YTextEvent, txn: import("yjs").Transaction) => {
-			if (isLocalOrigin(txn.origin)) return;
-			this.log(`text observer: remote change to "${path}" (origin=${txn.origin})`);
+			if (isLocalOrigin(txn.origin, this.vaultSync.provider)) return;
+			const originLabel = describeOrigin(txn.origin, this.vaultSync.provider);
+			this.log(`text observer: remote change to "${path}" (origin=${originLabel})`);
 			this.scheduleWrite(path);
 		};
 
@@ -233,6 +287,16 @@ export class DiskMirror {
 	// -------------------------------------------------------------------
 
 	scheduleWrite(path: string): void {
+		path = normalizePath(path);
+		if (this.openPaths.has(path)) {
+			this.scheduleOpenWrite(path);
+			return;
+		}
+
+		this.scheduleClosedWrite(path);
+	}
+
+	private scheduleClosedWrite(path: string): void {
 		// Clear existing debounce for this path
 		const existing = this.debounceTimers.get(path);
 		if (existing) clearTimeout(existing);
@@ -250,10 +314,44 @@ export class DiskMirror {
 		);
 	}
 
+	private scheduleOpenWrite(path: string): void {
+		this.pendingOpenWrites.add(path);
+
+		const existing = this.openWriteTimers.get(path);
+		if (existing) clearTimeout(existing);
+
+		this.openWriteTimers.set(
+			path,
+			setTimeout(() => {
+				this.openWriteTimers.delete(path);
+				if (!this.pendingOpenWrites.has(path)) return;
+
+				if (this.isActivelyViewedPath(path)) {
+					this.log(`open-write: deferring "${path}" (active editor focused)`);
+					this.scheduleOpenWrite(path);
+					return;
+				}
+
+				if (this.hasRecentEditorActivity(path)) {
+					this.log(`open-write: deferring "${path}" (recent editor activity)`);
+					this.scheduleOpenWrite(path);
+					return;
+				}
+
+				this.pendingOpenWrites.delete(path);
+				this.writeQueue.add(path);
+				this.kickDrain();
+			}, OPEN_FILE_IDLE_MS),
+		);
+	}
+
 	/** Start the drain loop if not already running. */
-	private kickDrain(): void {
-		if (this.draining) return;
-		void this.drain();
+	private kickDrain(): Promise<void> {
+		if (this.drainPromise) return this.drainPromise;
+		this.drainPromise = this.drain().finally(() => {
+			this.drainPromise = null;
+		});
+		return this.drainPromise;
 	}
 
 	/**
@@ -282,7 +380,12 @@ export class DiskMirror {
 				}
 
 				// Execute writes in parallel
-				await Promise.all(batch.map((path) => this.flushWrite(path)));
+				await Promise.all(
+					batch.map((path) => {
+						const force = this.forcedWritePaths.delete(path);
+						return this.flushWrite(path, force);
+					}),
+				);
 			}
 		} finally {
 			this.draining = false;
@@ -293,11 +396,29 @@ export class DiskMirror {
 	// Disk write
 	// -------------------------------------------------------------------
 
-	async flushWrite(path: string): Promise<void> {
+	async flushWrite(path: string, force = false): Promise<void> {
+		path = normalizePath(path);
+		return this.runPathWriteLocked(path, () => this.flushWriteUnlocked(path, force));
+	}
+
+	private async flushWriteUnlocked(path: string, force: boolean): Promise<void> {
 		const ytext = this.vaultSync.getTextForPath(path);
 		if (!ytext) {
 			this.log(`flushWrite: no Y.Text for "${path}", skipping`);
 			return;
+		}
+
+		if (!force && this.openPaths.has(path)) {
+			if (this.isActivelyViewedPath(path)) {
+				this.log(`flushWrite: deferring open "${path}" (active editor focused)`);
+				this.scheduleOpenWrite(path);
+				return;
+			}
+			if (this.hasRecentEditorActivity(path)) {
+				this.log(`flushWrite: deferring open "${path}" (recent editor activity)`);
+				this.scheduleOpenWrite(path);
+				return;
+			}
 		}
 
 		const content = ytext.toString();
@@ -312,11 +433,11 @@ export class DiskMirror {
 					return;
 				}
 
-				this.suppress(path);
+				this.suppressWrite(path, content);
 				await this.app.vault.modify(existing, content);
 				this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
 			} else {
-				this.suppress(path);
+				this.suppressWrite(path, content);
 				const dir = normalized.substring(0, normalized.lastIndexOf("/"));
 				if (dir) {
 					const dirExists =
@@ -337,13 +458,20 @@ export class DiskMirror {
 
 	private async handleRemoteDelete(path: string): Promise<void> {
 		const normalized = normalizePath(path);
+		this.trace?.("disk", "remote-delete", {
+			path,
+			normalizedPath: normalized,
+			wasOpen: this.openPaths.has(path),
+			wasObserved: this.textObservers.has(path),
+			wasSuppressed: this.isSuppressed(path),
+		});
 		// Unbind editor before suppressed delete so the vault `delete` event
 		// (which skips unbind due to suppression) doesn't leave a stale binding.
 		this.editorBindings.unbindByPath(normalized);
 		const file = this.app.vault.getAbstractFileByPath(normalized);
 		if (file instanceof TFile) {
 			try {
-				this.suppress(path);
+				this.suppressDelete(path);
 				await this.app.vault.delete(file);
 				this.log(`handleRemoteDelete: deleted "${path}" from disk`);
 			} catch (err) {
@@ -360,15 +488,64 @@ export class DiskMirror {
 	// -------------------------------------------------------------------
 
 	isSuppressed(path: string): boolean {
-		const until = this.suppressedPaths.get(path);
-		if (!until) return false;
-		if (Date.now() < until) return true;
-		this.suppressedPaths.delete(path);
-		return false;
+		return this.getActiveSuppression(path) !== null;
 	}
 
-	private suppress(path: string): void {
-		this.suppressedPaths.set(path, Date.now() + SUPPRESS_MS);
+	async shouldSuppressModify(file: TFile): Promise<boolean> {
+		return this.shouldSuppressWriteEvent(file, "modify");
+	}
+
+	async shouldSuppressCreate(file: TFile): Promise<boolean> {
+		return this.shouldSuppressWriteEvent(file, "create");
+	}
+
+	consumeDeleteSuppression(path: string): boolean {
+		path = normalizePath(path);
+		const entry = this.getActiveSuppression(path);
+		if (!entry) return false;
+
+		this.suppressedPaths.delete(path);
+		return entry.kind === "delete";
+	}
+
+	async flushOpenWrites(reason: string): Promise<void> {
+		const targets = new Set<string>();
+		for (const path of this.pendingOpenWrites) {
+			targets.add(path);
+		}
+		for (const path of this.openWriteTimers.keys()) {
+			targets.add(path);
+		}
+		if (targets.size === 0) return;
+
+		for (const path of targets) {
+			const timer = this.openWriteTimers.get(path);
+			if (timer) {
+				clearTimeout(timer);
+				this.openWriteTimers.delete(path);
+			}
+			this.pendingOpenWrites.delete(path);
+			this.queueImmediateWrite(path, reason, true);
+		}
+
+		await this.kickDrain();
+	}
+
+	async flushOpenPath(path: string, reason: string): Promise<void> {
+		path = normalizePath(path);
+		const timer = this.openWriteTimers.get(path);
+		const hadTimer = !!timer;
+		if (timer) {
+			clearTimeout(timer);
+			this.openWriteTimers.delete(path);
+		}
+		const wasPending = this.pendingOpenWrites.delete(path);
+		const wasQueued = this.writeQueue.has(path);
+		if (!wasPending && !hadTimer && !wasQueued) {
+			return;
+		}
+		this.queueImmediateWrite(path, reason, true);
+		await this.kickDrain();
 	}
 
 	// -------------------------------------------------------------------
@@ -380,7 +557,31 @@ export class DiskMirror {
 	}
 
 	get pendingWriteCount(): number {
-		return this.writeQueue.size + this.debounceTimers.size;
+		return (
+			this.writeQueue.size
+			+ this.debounceTimers.size
+			+ this.openWriteTimers.size
+		);
+	}
+
+	getDebugSnapshot(): {
+		observedPaths: string[];
+		openPaths: string[];
+		openPendingPaths: string[];
+		queuedWrites: string[];
+		debounceCount: number;
+		openDebounceCount: number;
+		suppressedCount: number;
+	} {
+		return {
+			observedPaths: Array.from(this.textObservers.keys()),
+			openPaths: Array.from(this.openPaths.keys()),
+			openPendingPaths: Array.from(this.pendingOpenWrites.keys()),
+			queuedWrites: Array.from(this.writeQueue.keys()),
+			debounceCount: this.debounceTimers.size,
+			openDebounceCount: this.openWriteTimers.size,
+			suppressedCount: this.suppressedPaths.size,
+		};
 	}
 
 	// -------------------------------------------------------------------
@@ -388,6 +589,17 @@ export class DiskMirror {
 	// -------------------------------------------------------------------
 
 	destroy(): void {
+		const pendingFinalWrites = new Set<string>();
+		for (const path of this.pendingOpenWrites) {
+			pendingFinalWrites.add(path);
+		}
+		for (const path of this.openWriteTimers.keys()) {
+			pendingFinalWrites.add(path);
+		}
+		for (const path of pendingFinalWrites) {
+			void this.flushWrite(path, true);
+		}
+
 		for (const cleanup of this.mapObserverCleanups) {
 			cleanup();
 		}
@@ -402,15 +614,149 @@ export class DiskMirror {
 			clearTimeout(timer);
 		}
 		this.debounceTimers.clear();
+		for (const timer of this.openWriteTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.openWriteTimers.clear();
 
 		this.writeQueue.clear();
+		this.pendingOpenWrites.clear();
+		this.openPaths.clear();
+		this.forcedWritePaths.clear();
 		this.suppressedPaths.clear();
+		this.pathWriteLocks.clear();
 		this.log("DiskMirror destroyed");
 	}
 
 	private log(msg: string): void {
+		this.trace?.("disk", msg);
 		if (this.debug) {
 			console.log(`[vault-crdt-sync:disk] ${msg}`);
 		}
+	}
+
+	private hasRecentEditorActivity(path: string): boolean {
+		const lastEditorActivity = this.editorBindings.getLastEditorActivityForPath(path);
+		if (lastEditorActivity == null) return false;
+		return Date.now() - lastEditorActivity < OPEN_FILE_ACTIVE_GRACE_MS;
+	}
+
+	private isActivelyViewedPath(path: string): boolean {
+		if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+			return false;
+		}
+		const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+		return activeView?.file?.path === path;
+	}
+
+	private queueImmediateWrite(path: string, reason: string, force = false): void {
+		path = normalizePath(path);
+		if (force) {
+			this.forcedWritePaths.add(path);
+		}
+		this.writeQueue.add(path);
+		this.log(`queueImmediateWrite: "${path}" (${reason}${force ? ", forced" : ""})`);
+		this.kickDrain();
+	}
+
+	private getActiveSuppression(path: string): SuppressionEntry | null {
+		path = normalizePath(path);
+		const entry = this.suppressedPaths.get(path);
+		if (!entry) return null;
+		if (Date.now() < entry.expiresAt) {
+			return entry;
+		}
+		this.suppressedPaths.delete(path);
+		return null;
+	}
+
+	private suppressWrite(path: string, content: string): void {
+		const fingerprint = this.fingerprintContent(content);
+		this.suppressedPaths.set(normalizePath(path), {
+			kind: "write",
+			expiresAt: Date.now() + SUPPRESS_MS,
+			expectedBytes: fingerprint.bytes,
+			expectedHash: fingerprint.hash,
+		});
+	}
+
+	private suppressDelete(path: string): void {
+		this.suppressedPaths.set(normalizePath(path), {
+			kind: "delete",
+			expiresAt: Date.now() + SUPPRESS_MS,
+		});
+	}
+
+	private async shouldSuppressWriteEvent(
+		file: TFile,
+		event: "modify" | "create",
+	): Promise<boolean> {
+		const path = normalizePath(file.path);
+		const entry = this.getActiveSuppression(path);
+		if (!entry) return false;
+
+		if (entry.kind !== "write") {
+			this.suppressedPaths.delete(path);
+			this.log(`suppression: "${path}" ${event} did not match pending delete`);
+			return false;
+		}
+
+		if (
+			typeof file.stat?.size === "number"
+			&& typeof entry.expectedBytes === "number"
+			&& file.stat.size !== entry.expectedBytes
+		) {
+			this.suppressedPaths.delete(path);
+			this.log(
+				`suppression: "${path}" ${event} size mismatch ` +
+				`(expected=${entry.expectedBytes}, observed=${file.stat.size})`,
+			);
+			return false;
+		}
+
+		try {
+			const content = await this.app.vault.read(file);
+			const fingerprint = this.fingerprintContent(content);
+			if (
+				fingerprint.bytes === entry.expectedBytes
+				&& fingerprint.hash === entry.expectedHash
+			) {
+				this.suppressedPaths.delete(path);
+				this.log(`suppression: acknowledged "${path}" ${event}`);
+				return true;
+			}
+		} catch {
+			// If the file cannot be read here, fall through and let normal sync handle it.
+		}
+
+		this.suppressedPaths.delete(path);
+		this.log(`suppression: "${path}" ${event} fingerprint mismatch`);
+		return false;
+	}
+
+	private fingerprintContent(content: string): { bytes: number; hash: string } {
+		const bytes = new TextEncoder().encode(content);
+		let hash = 2166136261;
+		for (let i = 0; i < bytes.length; i++) {
+			hash ^= bytes[i] ?? 0;
+			hash = Math.imul(hash, 16777619);
+		}
+		return {
+			bytes: bytes.length,
+			hash: (hash >>> 0).toString(16).padStart(8, "0"),
+		};
+	}
+
+	private runPathWriteLocked(path: string, work: () => Promise<void>): Promise<void> {
+		const previous = this.pathWriteLocks.get(path) ?? Promise.resolve();
+		const next = previous.catch(() => undefined).then(work);
+		let tracked: Promise<void>;
+		tracked = next.finally(() => {
+			if (this.pathWriteLocks.get(path) === tracked) {
+				this.pathWriteLocks.delete(path);
+			}
+		});
+		this.pathWriteLocks.set(path, tracked);
+		return tracked;
 	}
 }

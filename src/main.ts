@@ -1,4 +1,4 @@
-import { MarkdownView, Modal, Notice, Plugin, TFile } from "obsidian";
+import { MarkdownView, Modal, Notice, Plugin, TFile, normalizePath } from "obsidian";
 import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
@@ -17,7 +17,7 @@ import {
 	filterChangedFiles,
 	updateIndex,
 	moveIndexEntries,
-	waitForStable,
+	waitForDiskQuiet,
 } from "./sync/diskIndex";
 import {
 	type BlobHashCache,
@@ -33,6 +33,12 @@ import {
 	type SnapshotIndex,
 	type SnapshotDiff,
 } from "./sync/snapshotClient";
+import {
+	appendTraceParams,
+	PersistentTraceLogger,
+	type TraceEventDetails,
+	type TraceHttpContext,
+} from "./debug/trace";
 
 type SyncStatus = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
 
@@ -78,6 +84,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	/** Track the set of currently observed file paths for disk mirror cleanup. */
 	private openFilePaths = new Set<string>();
+	private activeMarkdownPath: string | null = null;
 
 	/** Parsed exclude patterns from settings. */
 	private excludePatterns: string[] = [];
@@ -103,18 +110,42 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	/** Timer for delayed reconcile after cooldown expires. */
 	private reconcileCooldownTimer: ReturnType<typeof setTimeout> | null = null;
 
+	/** In-memory ring of recent high-level plugin events. */
+	private eventRing: Array<{ ts: string; msg: string }> = [];
+
+	/** Persistent trace journal/state writer (active when debug is enabled). */
+	private traceLogger: PersistentTraceLogger | null = null;
+	private traceStateInterval: ReturnType<typeof setInterval> | null = null;
+	private traceStateTimer: ReturnType<typeof setTimeout> | null = null;
+	private traceServerInterval: ReturnType<typeof setInterval> | null = null;
+	private traceServerInFlight = false;
+	private recentServerTrace: unknown[] = [];
+
+	/**
+	 * True when startup timed out waiting for provider sync.
+	 * We use this to force one authoritative reconcile on the first late
+	 * provider sync event, even if connection generation did not change.
+	 */
+	private awaitingFirstProviderSyncAfterStartup = false;
+
 	async onload() {
 		await this.loadSettings();
 
+		let generatedVaultId = false;
 		if (!this.settings.vaultId) {
 			this.settings.vaultId = generateVaultId();
 			await this.saveSettings();
-			this.log(`Generated vault ID: ${this.settings.vaultId}`);
+			generatedVaultId = true;
 		}
 
 		if (!this.settings.deviceName) {
 			this.settings.deviceName = `device-${Date.now().toString(36)}`;
 			await this.saveSettings();
+		}
+
+		this.setupTraceLogger();
+		if (generatedVaultId) {
+			this.log(`Generated vault ID: ${this.settings.vaultId}`);
 		}
 
 		this.addSettingTab(new VaultSyncSettingTab(this.app, this));
@@ -157,12 +188,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private async initSync(): Promise<void> {
 		try {
 			// 1. Create VaultSync (Y.Doc + IndexedDB + provider in parallel)
-			this.vaultSync = new VaultSync(this.settings);
+			this.vaultSync = new VaultSync(this.settings, {
+				traceContext: this.getTraceHttpContext(),
+				trace: (source, msg, details) => this.trace(source, msg, details),
+			});
 
 			// 2. EditorBindingManager
 			this.editorBindings = new EditorBindingManager(
 				this.vaultSync,
 				this.settings.debug,
+				(source, msg, details) => this.trace(source, msg, details),
 			);
 
 			// 3. Global CM6 extension
@@ -176,6 +211,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.vaultSync,
 				this.editorBindings,
 				this.settings.debug,
+				(source, msg, details) => this.trace(source, msg, details),
 			);
 			this.diskMirror.startMapObservers();
 
@@ -191,8 +227,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						maxAttachmentSizeKB: this.settings.maxAttachmentSizeKB,
 						attachmentConcurrency: this.settings.attachmentConcurrency,
 						debug: this.settings.debug,
+						trace: this.getTraceHttpContext(),
 					},
 					this.blobHashCache,
+					(source, msg, details) => this.trace(source, msg, details),
 				);
 				this.blobSync.startObservers();
 
@@ -207,6 +245,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.vaultSync.provider.on("status", () => this.refreshStatusBar());
 			this.statusInterval = setInterval(() => {
 				this.refreshStatusBar();
+				if (this.reconciled && this.editorBindings) {
+					const touched = this.editorBindings.auditBindings("status-tick");
+					if (touched > 0) {
+						this.log(`Binding health audit (status-tick) — touched ${touched}`);
+						this.scheduleTraceStateSnapshot("binding-audit:status-tick");
+					}
+				}
 				// Periodically persist blob queue if transfers are active,
 				// or clear persisted queue if transfers completed
 				if (this.blobSync) {
@@ -240,6 +285,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				// Move disk mirror observers and openFilePaths tracking
 				// for any paths that were open before the rename.
 				for (const [oldPath, newPath] of renames) {
+					if (this.activeMarkdownPath === oldPath) {
+						this.activeMarkdownPath = newPath;
+					}
 					if (this.openFilePaths.has(oldPath)) {
 						this.diskMirror?.notifyFileClosed(oldPath);
 						this.openFilePaths.delete(oldPath);
@@ -283,6 +331,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				const mode = this.vaultSync.getSafeReconcileMode();
 				await this.runReconciliation(mode);
 				this.bindAllOpenEditors();
+				this.validateAllOpenBindings("startup-auth-fallback");
 				return;
 			}
 
@@ -290,6 +339,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.log("Waiting for provider sync...");
 			const providerSynced = await this.vaultSync.waitForProviderSync();
 			this.log(`Provider: ${providerSynced ? "synced" : "timed out (offline)"}`);
+			this.awaitingFirstProviderSyncAfterStartup = !providerSynced;
+			this.log(
+				`Startup sync gate: awaitingFirstProviderSyncAfterStartup=${this.awaitingFirstProviderSyncAfterStartup} ` +
+				`(gen=${this.vaultSync.connectionGeneration})`,
+			);
 
 			if (this.vaultSync.fatalAuthError) {
 				this.updateStatusBar("unauthorized");
@@ -302,11 +356,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			await this.runReconciliation(mode);
 			this.lastReconciledGeneration = this.vaultSync.connectionGeneration;
+			if (providerSynced) {
+				this.awaitingFirstProviderSyncAfterStartup = false;
+			}
 
 			this.bindAllOpenEditors();
+			this.validateAllOpenBindings("startup");
 
 			this.refreshStatusBar();
 			this.log("Startup complete");
+			this.scheduleTraceStateSnapshot("startup-complete");
 
 			// Trigger daily snapshot (noop if already taken today).
 			// Fire-and-forget — don't block startup on snapshot creation.
@@ -334,14 +393,38 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.vaultSync.onProviderSync((generation) => {
 			// Skip the initial sync — that's handled by the startup sequence
-			if (!this.reconciled) return;
+			if (!this.reconciled) {
+				this.log(`Provider sync ignored: initial startup still running (gen ${generation})`);
+				return;
+			}
+
+			// If startup timed out waiting for provider sync, the first late
+			// sync can arrive on the same connection generation. We still need
+			// one authoritative reconcile to import any remote changes.
+			if (this.awaitingFirstProviderSyncAfterStartup) {
+				this.awaitingFirstProviderSyncAfterStartup = false;
+				this.log(`Late first provider sync (gen ${generation}) — scheduling catch-up reconciliation`);
+				if (this.reconcileInFlight) {
+					this.log("Late first sync arrived during reconcile — marked pending");
+					this.reconcilePending = true;
+					return;
+				}
+				void this.runReconnectReconciliation(generation);
+				return;
+			}
 
 			// Skip if we already reconciled at this generation
-			if (generation <= this.lastReconciledGeneration) return;
+			if (generation <= this.lastReconciledGeneration) {
+				this.log(
+					`Provider sync ignored: generation ${generation} <= lastReconciledGeneration ${this.lastReconciledGeneration}`,
+				);
+				return;
+			}
 
 			this.log(`Reconnect detected (gen ${generation}) — scheduling re-reconciliation`);
 
 			if (this.reconcileInFlight) {
+				this.log("Reconnect sync arrived during reconcile — marked pending");
 				this.reconcilePending = true;
 				return;
 			}
@@ -358,6 +441,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (!this.vaultSync) return;
 
 		this.log(`Running reconnect reconciliation (gen ${generation})`);
+		this.validateAllOpenBindings(`reconnect-pre:${generation}`);
 
 		// Also import any untracked files from a previous conservative run
 		if (this.untrackedFiles.length > 0) {
@@ -366,7 +450,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		await this.runReconciliation("authoritative");
 		this.lastReconciledGeneration = generation;
+		this.awaitingFirstProviderSyncAfterStartup = false;
 		this.bindAllOpenEditors();
+		this.validateAllOpenBindings(`reconnect-post:${generation}`);
 
 		// If another reconnect arrived during this reconcile, run again
 		if (this.reconcilePending) {
@@ -384,6 +470,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 */
 	private setupVisibilityHandler(): void {
 		this.visibilityHandler = () => {
+			if (document.visibilityState === "hidden") {
+				void this.diskMirror?.flushOpenWrites("app-backgrounded");
+				return;
+			}
 			if (document.visibilityState !== "visible") return;
 			if (!this.vaultSync) return;
 			if (this.vaultSync.fatalAuthError) return;
@@ -439,6 +529,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		try {
 			const diskFiles = new Map<string, string>();
+			const diskPresentPaths = new Set<string>();
 			const allMdFiles = this.app.vault.getMarkdownFiles();
 			let excludedCount = 0;
 			let oversizedCount = 0;
@@ -452,15 +543,35 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					continue;
 				}
 				eligibleFiles.push(file);
+				diskPresentPaths.add(file.path);
 			}
 
-			// Use disk index to only read changed files
-			const { changed, unchanged, allStats } = await filterChangedFiles(
-				this.app,
-				eligibleFiles,
-				this.diskIndex,
-			);
-			skippedByIndex = unchanged.length;
+			// In conservative mode, use disk index optimization.
+			// In authoritative mode, read all files for correctness so we can
+			// detect and heal any disk<->CRDT drift after reconnect/startup.
+			let changed: TFile[] = [];
+			let unchanged: TFile[] = [];
+			let allStats: Map<string, { mtime: number; size: number }> = new Map();
+			if (mode === "authoritative") {
+				changed = eligibleFiles;
+				for (const file of eligibleFiles) {
+					const stat = await this.app.vault.adapter.stat(file.path);
+					if (stat) {
+						allStats.set(file.path, { mtime: stat.mtime, size: stat.size });
+					}
+				}
+				skippedByIndex = 0;
+			} else {
+				const indexResult = await filterChangedFiles(
+					this.app,
+					eligibleFiles,
+					this.diskIndex,
+				);
+				changed = indexResult.changed;
+				unchanged = indexResult.unchanged;
+				allStats = indexResult.allStats;
+				skippedByIndex = unchanged.length;
+			}
 
 			// For unchanged files, we still need them in the diskFiles map
 			// so reconcileVault knows they exist on disk (for the "disk-only
@@ -524,18 +635,38 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 
 			this.log(
-				`Reconciling [${mode}]: ${diskFiles.size} disk files (${changed.length} read) vs ` +
+				`Reconciling [${mode}]: diskPresent=${diskPresentPaths.size}, ` +
+				`diskLoaded=${diskFiles.size} (${changed.length} read) vs ` +
 				`${this.vaultSync.pathToId.size} CRDT paths`,
 			);
 
 			const result = this.vaultSync.reconcileVault(
 				diskFiles,
+				diskPresentPaths,
 				mode,
 				this.settings.deviceName,
 			);
 
-			for (const path of result.createdOnDisk) {
-				await this.diskMirror.flushWrite(path);
+			// Safety brake: large create-on-disk batches are usually a signal that
+			// presence bookkeeping is wrong or stale. Abort destructive writeback.
+			const crdtPathCount = this.vaultSync.pathToId.size;
+			const writeCount = result.createdOnDisk.length + result.updatedOnDisk.length;
+			const writeRatio = crdtPathCount > 0 ? (writeCount / crdtPathCount) : 0;
+			if (writeCount > 20 && writeRatio > 0.25) {
+				const msg =
+					`Reconcile safety brake: refusing to write ${writeCount} ` +
+					`files to disk (${Math.round(writeRatio * 100)}% of CRDT paths).`;
+				this.log(msg);
+				console.error(`[vault-crdt-sync] ${msg}`);
+				new Notice(`Vault CRDT sync: ${msg} Run "Export sync diagnostics" and inspect logs.`);
+				// Continue with non-destructive state updates below; skip flushWrite loop.
+			} else {
+				for (const path of result.createdOnDisk) {
+					await this.diskMirror.flushWrite(path);
+				}
+				for (const path of result.updatedOnDisk) {
+					await this.diskMirror.flushWrite(path);
+				}
 			}
 
 			this.untrackedFiles = result.untracked;
@@ -558,6 +689,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				`Reconciliation [${mode}] complete: ` +
 				`${result.seededToCrdt.length} seeded, ` +
 				`${result.createdOnDisk.length} created on disk, ` +
+				`${result.updatedOnDisk.length} updated on disk, ` +
 				`${result.untracked.length} untracked, ` +
 				`${result.skipped} tombstoned`,
 			);
@@ -578,6 +710,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		} finally {
 			this.reconcileInFlight = false;
 			this.lastReconcileTime = Date.now();
+			this.scheduleTraceStateSnapshot(`reconcile-${mode}`);
 		}
 	}
 
@@ -634,6 +767,48 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				}
 			}
 		});
+		this.activeMarkdownPath = this.getActiveMarkdownPath();
+	}
+
+	private validateAllOpenBindings(reason: string): void {
+		let touched = 0;
+
+		this.app.workspace.iterateAllLeaves((leaf) => {
+			if (!(leaf.view instanceof MarkdownView) || !leaf.view.file) {
+				return;
+			}
+
+			const binding = this.editorBindings?.getBindingDebugInfoForView(leaf.view) ?? null;
+			const health = this.editorBindings?.getBindingHealthForView(leaf.view) ?? null;
+
+			if (health?.bound && (health.healthy || health.settling)) {
+				return;
+			}
+
+			touched += 1;
+			if (!binding || !health?.bound) {
+				this.editorBindings?.bind(leaf.view, this.settings.deviceName);
+				return;
+			}
+
+			const repaired = this.editorBindings?.heal(
+				leaf.view,
+				this.settings.deviceName,
+				`validate:${reason}`,
+			) ?? false;
+			if (!repaired) {
+				this.editorBindings?.rebind(
+					leaf.view,
+					this.settings.deviceName,
+					`validate:${reason}`,
+				);
+			}
+		});
+
+		if (touched > 0) {
+			this.log(`Validated open bindings (${reason}) — touched ${touched}`);
+			this.scheduleTraceStateSnapshot(`validate-open-bindings:${reason}`);
+		}
 	}
 
 	/**
@@ -663,6 +838,24 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.log(`Closed observer for "${tracked}" (no longer open)`);
 			}
 		}
+		this.scheduleTraceStateSnapshot("track-open-file");
+	}
+
+	private getActiveMarkdownPath(): string | null {
+		const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+		return activeView?.file?.path ?? null;
+	}
+
+	private updateActiveMarkdownPath(nextPath: string | null, reason: string): void {
+		const previousPath = this.activeMarkdownPath;
+		this.activeMarkdownPath = nextPath;
+
+		if (!previousPath || previousPath === nextPath) {
+			return;
+		}
+
+		this.editorBindings?.clearLocalCursor(reason);
+		void this.diskMirror?.flushOpenPath(previousPath, reason);
 	}
 
 	// -------------------------------------------------------------------
@@ -674,6 +867,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.registerEvent(
 			this.app.workspace.on("layout-change", () => {
 				if (!this.reconciled) return;
+				this.editorBindings?.clearLocalCursor("layout-change");
 				const currentlyOpen = new Set<string>();
 				this.app.workspace.iterateAllLeaves((leaf) => {
 					if (leaf.view instanceof MarkdownView && leaf.view.file) {
@@ -687,12 +881,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						this.log(`layout-change: closed observer for "${tracked}"`);
 					}
 				}
+				this.updateActiveMarkdownPath(
+					this.getActiveMarkdownPath(),
+					"layout-change-active-blur",
+				);
+				const touched = this.editorBindings?.auditBindings("layout-change") ?? 0;
+				if (touched > 0) {
+					this.log(`Binding health audit (layout-change) — touched ${touched}`);
+					this.scheduleTraceStateSnapshot("binding-audit:layout-change");
+				}
 			}),
 		);
 
 		this.registerEvent(
 			this.app.workspace.on("active-leaf-change", (leaf) => {
-				if (!this.reconciled || !leaf) return;
+				if (!this.reconciled) return;
+				const nextPath =
+					leaf?.view instanceof MarkdownView ? (leaf.view.file?.path ?? null) : null;
+				this.updateActiveMarkdownPath(nextPath, "active-leaf-change");
+				if (!leaf) return;
 				const view = leaf.view;
 				if (view instanceof MarkdownView) {
 					this.editorBindings?.bind(view, this.settings.deviceName);
@@ -705,7 +912,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.workspace.on("file-open", (file) => {
-				if (!this.reconciled || !file) return;
+				if (!this.reconciled) return;
+				this.updateActiveMarkdownPath(
+					file?.path ?? null,
+					"file-open-active-change",
+				);
+				if (!file) return;
 				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
 				if (view && view.file?.path === file.path) {
 					this.editorBindings?.bind(view, this.settings.deviceName);
@@ -725,11 +937,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!(file instanceof TFile)) return;
 
 				if (isMarkdownSyncable(file.path, this.excludePatterns)) {
-					if (this.diskMirror?.isSuppressed(file.path)) {
-						this.log(`Suppressed modify event for "${file.path}"`);
-						return;
-					}
-					void this.syncFileFromDisk(file);
+					void this.handleMarkdownModify(file);
 				} else if (this.blobSync && isBlobSyncable(file.path, this.excludePatterns) && !this.blobSync.isSuppressed(file.path)) {
 					this.blobSync.handleFileChange(file);
 				}
@@ -760,7 +968,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!(file instanceof TFile)) return;
 
 				if (isMarkdownSyncable(file.path, this.excludePatterns)) {
-					if (this.diskMirror?.isSuppressed(file.path)) {
+					if (this.diskMirror?.consumeDeleteSuppression(file.path)) {
 						this.log(`Suppressed delete event for "${file.path}"`);
 						return;
 					}
@@ -786,27 +994,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!(file instanceof TFile)) return;
 
 				if (isMarkdownSyncable(file.path, this.excludePatterns)) {
-					if (this.diskMirror?.isSuppressed(file.path)) return;
-
-					// Debounce rapid creates (like unzip or folder paste)
-					if (this.pendingStabilityChecks.has(file.path)) return;
-					this.pendingStabilityChecks.add(file.path);
-
-					// Wait for file stability (OS writes to finish) before importing
-					void waitForStable(this.app, file.path).then((stable) => {
-						this.pendingStabilityChecks.delete(file.path);
-						if (stable) {
-							void this.syncFileFromDisk(file);
-						} else {
-							this.log(`Create: "${file.path}" unstable after timeout, skipping import`);
-						}
-					});
+					void this.handleMarkdownCreate(file);
 				} else if (this.blobSync && isBlobSyncable(file.path, this.excludePatterns) && !this.blobSync.isSuppressed(file.path)) {
 					// For blob files, use the same stability check before uploading
 					if (this.pendingStabilityChecks.has(file.path)) return;
 					this.pendingStabilityChecks.add(file.path);
 
-					void waitForStable(this.app, file.path).then((stable) => {
+					void waitForDiskQuiet(this.app, file.path).then((stable) => {
 						this.pendingStabilityChecks.delete(file.path);
 						if (stable) {
 							this.blobSync?.handleFileChange(file);
@@ -864,7 +1058,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.reconcilePending = false;
 		this.untrackedFiles = [];
 		this.lastReconciledGeneration = 0;
+		this.awaitingFirstProviderSyncAfterStartup = false;
 		this.openFilePaths.clear();
+		this.activeMarkdownPath = null;
 
 		this.updateStatusBar("disconnected");
 	}
@@ -894,6 +1090,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				const mode = this.vaultSync.getSafeReconcileMode();
 				void this.runReconciliation(mode).then(() => {
 					this.bindAllOpenEditors();
+					this.validateAllOpenBindings("manual-reconcile");
 				});
 			},
 		});
@@ -918,6 +1115,24 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					() => new Notice("Failed to copy to clipboard. Check console.", 5000),
 				);
 				console.log("[vault-crdt-sync] Debug info:\n" + info);
+			},
+		});
+
+		this.addCommand({
+			id: "vault-crdt-sync-show-recent-events",
+			name: "Show recent sync events",
+			callback: () => {
+				const text = this.buildRecentEventsText(80);
+				new Notice("Recent sync events printed to console.", 5000);
+				console.log("[vault-crdt-sync] Recent sync events:\n" + text);
+			},
+		});
+
+		this.addCommand({
+			id: "vault-crdt-sync-export-diagnostics",
+			name: "Export sync diagnostics",
+			callback: () => {
+				void this.exportDiagnostics();
 			},
 		});
 
@@ -996,6 +1211,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					const result = await requestSnapshotNow(
 						this.settings,
 						this.settings.deviceName,
+						this.getTraceHttpContext(),
 					);
 					if (result.status === "created" && result.index) {
 						new Notice(
@@ -1152,23 +1368,51 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 	}
 
+	private async handleMarkdownModify(file: TFile): Promise<void> {
+		if (await this.diskMirror?.shouldSuppressModify(file)) {
+			this.log(`Suppressed modify event for "${file.path}"`);
+			return;
+		}
+
+		await this.syncFileFromDisk(file);
+	}
+
+	private async handleMarkdownCreate(file: TFile): Promise<void> {
+		if (await this.diskMirror?.shouldSuppressCreate(file)) {
+			this.log(`Suppressed create event for "${file.path}"`);
+			return;
+		}
+
+		if (this.vaultSync?.isPendingRenameTarget(file.path)) {
+			this.log(`Create: "${file.path}" is a pending rename target, skipping import`);
+			return;
+		}
+
+		// Debounce rapid creates (like unzip or folder paste)
+		if (this.pendingStabilityChecks.has(file.path)) return;
+		this.pendingStabilityChecks.add(file.path);
+
+		// Give the adapter a short quiet window before importing a new file.
+		const settled = await waitForDiskQuiet(this.app, file.path);
+		this.pendingStabilityChecks.delete(file.path);
+		if (!settled) {
+			this.log(`Create: "${file.path}" still changing after quiet window, skipping import`);
+			return;
+		}
+
+		await this.syncFileFromDisk(file);
+	}
+
 	private async syncFileFromDisk(file: TFile): Promise<void> {
 		if (!this.vaultSync) return;
 		if (!isMarkdownSyncable(file.path, this.excludePatterns)) return;
 
-		// Always skip files currently bound to an editor. When a file is
-		// open, the editor → yCollab pipeline is the authoritative source
-		// of truth. Reading from disk and diffing back into the Y.Text
-		// is redundant and can cause cursor jumps during fast typing.
-		if (this.editorBindings?.isBound(file.path)) {
-			this.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound)`);
-			return;
-		}
+		const wasBound = this.editorBindings?.isBound(file.path) ?? false;
 
 		// External edit policy gate: control whether disk changes to
 		// *closed* files are imported into the CRDT.
 		const policy = this.settings.externalEditPolicy;
-		if (policy === "never") {
+		if (!wasBound && policy === "never") {
 			this.log(`syncFileFromDisk: skipping "${file.path}" (external edit policy: never)`);
 			return;
 		}
@@ -1182,6 +1426,24 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				return;
 			}
 			const existingText = this.vaultSync.getTextForPath(file.path);
+
+			if (wasBound) {
+				const handledBound = await this.handleBoundFileSyncGap(
+					file,
+					content,
+					existingText,
+				);
+				if (handledBound) {
+					await this.updateDiskIndexForPath(file.path);
+					return;
+				}
+			}
+
+			if (policy === "never") {
+				this.log(`syncFileFromDisk: skipping "${file.path}" (external edit policy: never)`);
+				await this.updateDiskIndexForPath(file.path);
+				return;
+			}
 
 			if (existingText) {
 				const crdtContent = existingText.toString();
@@ -1203,18 +1465,163 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				);
 			}
 
-			// Update disk index for this file
-			try {
-				const stat = await this.app.vault.adapter.stat(file.path);
-				if (stat) {
-					this.diskIndex[file.path] = { mtime: stat.mtime, size: stat.size };
-				}
-			} catch { /* stat failed, index will be stale for this path */ }
+			await this.updateDiskIndexForPath(file.path);
 		} catch (err) {
 			console.error(
 				`[vault-crdt-sync] syncFileFromDisk failed for "${file.path}":`,
 				err,
 			);
+		}
+	}
+
+	private getOpenMarkdownViewsForPath(path: string): MarkdownView[] {
+		const views: MarkdownView[] = [];
+		this.app.workspace.iterateAllLeaves((leaf) => {
+			if (
+				leaf.view instanceof MarkdownView
+				&& leaf.view.file?.path === path
+			) {
+				views.push(leaf.view);
+			}
+		});
+		return views;
+	}
+
+	private async handleBoundFileSyncGap(
+		file: TFile,
+		content: string,
+		existingText: ReturnType<VaultSync["getTextForPath"]>,
+	): Promise<boolean> {
+		const openViews = this.getOpenMarkdownViewsForPath(file.path);
+		if (openViews.length === 0) {
+			this.trace("trace", "stale-bound-path-without-open-view", {
+				path: file.path,
+			});
+			this.editorBindings?.unbindByPath(file.path);
+			this.log(`syncFileFromDisk: cleared stale bound state for "${file.path}" (no live view)`);
+			return false;
+		}
+
+		const crdtContent = existingText?.toString() ?? null;
+		if (crdtContent === content) {
+			this.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, crdt-current)`);
+			return true;
+		}
+
+		const viewStates = openViews.map((view) => {
+			const editorContent = view.editor.getValue();
+			const binding = this.editorBindings?.getBindingDebugInfoForView(view) ?? null;
+			const collab = this.editorBindings?.getCollabDebugInfoForView(view) ?? null;
+			return {
+				view,
+				editorContent,
+				editorMatchesDisk: editorContent === content,
+				editorMatchesCrdt: crdtContent != null && editorContent === crdtContent,
+				binding,
+				collab,
+			};
+		});
+
+		const localOnlyViews = viewStates.filter(
+			(state) => state.editorMatchesDisk && !state.editorMatchesCrdt,
+		);
+		if (localOnlyViews.length > 0) {
+			this.trace("trace", "bound-file-local-only-divergence", {
+				path: file.path,
+				diskLength: content.length,
+				crdtLength: crdtContent?.length ?? null,
+				viewCount: localOnlyViews.length,
+				views: localOnlyViews.map((state) => ({
+					leafId: state.binding?.leafId ?? null,
+					storedCmId: state.binding?.storedCmId ?? null,
+					liveCmId: state.binding?.liveCmId ?? null,
+					cmMatches: state.binding?.cmMatches ?? null,
+					hasSyncFacet: state.collab?.hasSyncFacet ?? null,
+					awarenessMatchesProvider: state.collab?.awarenessMatchesProvider ?? null,
+					yTextMatchesExpected: state.collab?.yTextMatchesExpected ?? null,
+					undoManagerMatchesFacet: state.collab?.undoManagerMatchesFacet ?? null,
+					facetFileId: state.collab?.facetFileId ?? null,
+					expectedFileId: state.collab?.expectedFileId ?? null,
+				})),
+			});
+
+			if (existingText) {
+				this.log(
+					`syncFileFromDisk: recovering "${file.path}" ` +
+					`(editor-bound local-only divergence: ${crdtContent?.length ?? 0} -> ${content.length} chars)`,
+				);
+				applyDiffToYText(existingText, crdtContent ?? "", content, "disk-sync-recover-bound");
+			} else {
+				this.log(
+					`syncFileFromDisk: recovering "${file.path}" ` +
+					`(editor-bound, missing CRDT text: seeding ${content.length} chars)`,
+				);
+				this.vaultSync?.ensureFile(
+					file.path,
+					content,
+					this.settings.deviceName,
+				);
+				}
+
+				for (const state of localOnlyViews) {
+					const repaired = this.editorBindings?.heal(
+						state.view,
+						this.settings.deviceName,
+						"bound-file-local-only-divergence",
+					) ?? false;
+					if (!repaired) {
+						this.editorBindings?.rebind(
+							state.view,
+							this.settings.deviceName,
+							"bound-file-local-only-divergence",
+						);
+					}
+				}
+
+			this.scheduleTraceStateSnapshot("bound-file-desync-recovery");
+			return true;
+		}
+
+		const crdtOnlyViews = viewStates.filter(
+			(state) => state.editorMatchesCrdt && !state.editorMatchesDisk,
+		);
+		if (crdtOnlyViews.length > 0) {
+			this.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, disk lag)`);
+			return true;
+		}
+
+		this.trace("trace", "bound-file-ambiguous-divergence", {
+			path: file.path,
+			diskLength: content.length,
+			crdtLength: crdtContent?.length ?? null,
+			views: viewStates.map((state) => ({
+				leafId: state.binding?.leafId ?? null,
+				storedCmId: state.binding?.storedCmId ?? null,
+				liveCmId: state.binding?.liveCmId ?? null,
+				cmMatches: state.binding?.cmMatches ?? null,
+				editorMatchesDisk: state.editorMatchesDisk,
+				editorMatchesCrdt: state.editorMatchesCrdt,
+				hasSyncFacet: state.collab?.hasSyncFacet ?? null,
+				awarenessMatchesProvider: state.collab?.awarenessMatchesProvider ?? null,
+				yTextMatchesExpected: state.collab?.yTextMatchesExpected ?? null,
+				undoManagerMatchesFacet: state.collab?.undoManagerMatchesFacet ?? null,
+				facetFileId: state.collab?.facetFileId ?? null,
+				expectedFileId: state.collab?.expectedFileId ?? null,
+			})),
+		});
+		this.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, ambiguous divergence)`);
+		this.scheduleTraceStateSnapshot("bound-file-ambiguous");
+		return true;
+	}
+
+	private async updateDiskIndexForPath(path: string): Promise<void> {
+		try {
+			const stat = await this.app.vault.adapter.stat(path);
+			if (stat) {
+				this.diskIndex[path] = { mtime: stat.mtime, size: stat.size };
+			}
+		} catch {
+			// Stat failed, index will be stale for this path.
 		}
 	}
 
@@ -1283,8 +1690,290 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.statusBarEl.setText(text);
 	}
 
+	private setupTraceLogger(): void {
+		if (!this.settings.debug) return;
+
+		this.traceLogger = new PersistentTraceLogger(this.app, {
+			enabled: this.settings.debug,
+			deviceName: this.settings.deviceName || "unknown-device",
+			vaultId: this.settings.vaultId || "unknown-vault",
+		});
+		this.trace(
+			"trace",
+			"trace-session-start",
+			{
+				host: this.settings.host,
+				enableAttachmentSync: this.settings.enableAttachmentSync,
+				externalEditPolicy: this.settings.externalEditPolicy,
+			},
+		);
+
+		this.traceStateInterval = setInterval(() => {
+			this.scheduleTraceStateSnapshot("interval");
+		}, 5000);
+		this.traceServerInterval = setInterval(() => {
+			void this.refreshServerTrace();
+		}, 15000);
+		void this.refreshServerTrace();
+
+		const errorHandler = (event: ErrorEvent) => {
+			this.trace("trace", "window-error", {
+				message: event.message,
+				filename: event.filename,
+				lineno: event.lineno,
+				colno: event.colno,
+			});
+			this.traceLogger?.captureCrash("window-error", event.error ?? event.message, {
+				filename: event.filename,
+				lineno: event.lineno,
+				colno: event.colno,
+			});
+			this.scheduleTraceStateSnapshot("window-error");
+		};
+
+		const rejectionHandler = (event: PromiseRejectionEvent) => {
+			this.trace("trace", "unhandled-rejection", {
+				reason: String(event.reason),
+			});
+			this.traceLogger?.captureCrash("unhandled-rejection", event.reason);
+			this.scheduleTraceStateSnapshot("unhandled-rejection");
+		};
+
+		window.addEventListener("error", errorHandler);
+		window.addEventListener("unhandledrejection", rejectionHandler);
+		this.register(() => {
+			window.removeEventListener("error", errorHandler);
+			window.removeEventListener("unhandledrejection", rejectionHandler);
+		});
+
+		this.register(() => {
+			if (this.traceStateInterval) {
+				clearInterval(this.traceStateInterval);
+				this.traceStateInterval = null;
+			}
+			if (this.traceServerInterval) {
+				clearInterval(this.traceServerInterval);
+				this.traceServerInterval = null;
+			}
+		});
+		this.scheduleTraceStateSnapshot("plugin-load");
+	}
+
+	private getTraceHttpContext(): TraceHttpContext | undefined {
+		return this.traceLogger?.httpContext;
+	}
+
+	private trace(
+		source: string,
+		msg: string,
+		details?: TraceEventDetails,
+	): void {
+		this.traceLogger?.record(source, msg, details);
+	}
+
+	private scheduleTraceStateSnapshot(reason: string): void {
+		if (!this.traceLogger?.isEnabled) return;
+		if (this.traceStateTimer) clearTimeout(this.traceStateTimer);
+		this.traceStateTimer = setTimeout(() => {
+			this.traceStateTimer = null;
+			void this.writeTraceStateSnapshot(reason);
+		}, 250);
+	}
+
+	private async writeTraceStateSnapshot(reason: string): Promise<void> {
+		if (!this.traceLogger?.isEnabled) return;
+		const snapshot = await this.buildTraceStateSnapshot(reason);
+		this.traceLogger.updateCurrentState(snapshot);
+	}
+
+	private async refreshServerTrace(): Promise<void> {
+		if (!this.traceLogger?.isEnabled) return;
+		if (!this.settings.host || !this.settings.token || !this.settings.vaultId) return;
+		if (this.traceServerInFlight) return;
+
+		this.traceServerInFlight = true;
+		try {
+			const host = this.settings.host.replace(/\/$/, "");
+			const roomId = `v1:${this.settings.vaultId}`;
+			const roomPathCandidates = [roomId, encodeURIComponent(roomId)];
+			let lastError: Error | null = null;
+
+			for (const roomPath of roomPathCandidates) {
+				const url = appendTraceParams(
+					`${host}/parties/main/${roomPath}/debug/recent?token=${encodeURIComponent(this.settings.token)}`,
+					this.getTraceHttpContext(),
+				);
+				const res = await fetch(url, { method: "GET" });
+				if (!res.ok) {
+					lastError = new Error(`server debug fetch failed (${res.status})`);
+					continue;
+				}
+
+				const payload = (await res.json()) as {
+					recent?: unknown[];
+					roomId?: unknown;
+				};
+				if (typeof payload.roomId === "string" && payload.roomId !== roomId) {
+					lastError = new Error(
+						`server debug fetch returned mismatched room (${payload.roomId})`,
+					);
+					continue;
+				}
+
+				this.recentServerTrace = Array.isArray(payload.recent)
+					? payload.recent.slice(-120)
+					: [];
+				this.scheduleTraceStateSnapshot("server-trace-refresh");
+				return;
+			}
+
+			throw lastError ?? new Error("server debug fetch failed");
+		} catch (err) {
+			this.trace("trace", "server-trace-fetch-failed", {
+				error: String(err),
+			});
+		} finally {
+			this.traceServerInFlight = false;
+		}
+	}
+
+	private async buildTraceStateSnapshot(reason: string): Promise<Record<string, unknown>> {
+		return {
+			generatedAt: new Date().toISOString(),
+			reason,
+			trace: this.getTraceHttpContext() ?? null,
+			settings: {
+				host: this.settings.host,
+				vaultId: this.settings.vaultId,
+				deviceName: this.settings.deviceName,
+				debug: this.settings.debug,
+				enableAttachmentSync: this.settings.enableAttachmentSync,
+				externalEditPolicy: this.settings.externalEditPolicy,
+			},
+			state: {
+				reconciled: this.reconciled,
+				reconcileInFlight: this.reconcileInFlight,
+				reconcilePending: this.reconcilePending,
+				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
+				lastReconciledGeneration: this.lastReconciledGeneration,
+				openFileCount: this.openFilePaths.size,
+			},
+			sync: this.vaultSync?.getDebugSnapshot() ?? null,
+			diskMirror: this.diskMirror?.getDebugSnapshot() ?? null,
+			blobSync: this.blobSync?.getDebugSnapshot() ?? null,
+			openFiles: await this.collectOpenFileTraceState(),
+			recentEvents: {
+				plugin: this.eventRing.slice(-120),
+				sync: this.vaultSync?.getRecentEvents(120) ?? [],
+			},
+			serverTrace: this.recentServerTrace,
+		};
+	}
+
+	private async collectOpenFileTraceState(): Promise<Array<Record<string, unknown>>> {
+		if (!this.vaultSync) return [];
+
+		const probes: Array<Record<string, unknown>> = [];
+		const leaves: MarkdownView[] = [];
+		this.app.workspace.iterateAllLeaves((leaf) => {
+			if (leaf.view instanceof MarkdownView && leaf.view.file) {
+				leaves.push(leaf.view);
+			}
+		});
+
+		for (const view of leaves) {
+			const file = view.file;
+			if (!file) continue;
+
+			const path = file.path;
+			const editorContent = view.editor.getValue();
+			const diskContent = await this.app.vault.read(file).catch(() => null);
+			const crdtContent = this.vaultSync.getTextForPath(path)?.toString() ?? null;
+			const binding = this.editorBindings?.getBindingDebugInfoForView(view) ?? null;
+			const collab = this.editorBindings?.getCollabDebugInfoForView(view) ?? null;
+
+			const [editorHash, diskHash, crdtHash] = await Promise.all([
+				this.hashIfPresent(editorContent),
+				this.hashIfPresent(diskContent),
+				this.hashIfPresent(crdtContent),
+			]);
+
+			probes.push({
+				path,
+				leafId: binding?.leafId ?? ((view.leaf as unknown as { id?: string }).id ?? path),
+				binding,
+				collab,
+				hashes: {
+					editor: editorHash,
+					disk: diskHash,
+					crdt: crdtHash,
+				},
+				lengths: {
+					editor: editorContent.length,
+					disk: diskContent?.length ?? null,
+					crdt: crdtContent?.length ?? null,
+				},
+				editorVsDisk: this.describeContentDiff(editorContent, diskContent),
+				editorVsCrdt: this.describeContentDiff(editorContent, crdtContent),
+				diskVsCrdt: this.describeContentDiff(diskContent, crdtContent),
+			});
+		}
+
+		return probes;
+	}
+
+	private async hashIfPresent(text: string | null): Promise<string | null> {
+		if (text == null) return null;
+		return this.sha256Hex(text);
+	}
+
+	private describeContentDiff(
+		left: string | null,
+		right: string | null,
+	): Record<string, unknown> {
+		if (left == null || right == null) {
+			return {
+				comparable: false,
+				leftLength: left?.length ?? null,
+				rightLength: right?.length ?? null,
+			};
+		}
+
+		const firstDiffIndex = this.findFirstDiffIndex(left, right);
+		return {
+			comparable: true,
+			matches: firstDiffIndex === -1,
+			firstDiffIndex: firstDiffIndex === -1 ? null : firstDiffIndex,
+			leftLength: left.length,
+			rightLength: right.length,
+			leftSnippet: firstDiffIndex === -1 ? "" : left.slice(firstDiffIndex, firstDiffIndex + 160),
+			rightSnippet: firstDiffIndex === -1 ? "" : right.slice(firstDiffIndex, firstDiffIndex + 160),
+		};
+	}
+
+	private findFirstDiffIndex(left: string, right: string): number {
+		const max = Math.min(left.length, right.length);
+		for (let i = 0; i < max; i++) {
+			if (left[i] !== right[i]) return i;
+		}
+		return left.length === right.length ? -1 : max;
+	}
+
 	onunload() {
 		this.log("Unloading plugin");
+		if (this.traceStateTimer) {
+			clearTimeout(this.traceStateTimer);
+			this.traceStateTimer = null;
+		}
+		if (this.traceStateInterval) {
+			clearInterval(this.traceStateInterval);
+			this.traceStateInterval = null;
+		}
+		if (this.traceServerInterval) {
+			clearInterval(this.traceServerInterval);
+			this.traceServerInterval = null;
+		}
+		void this.traceLogger?.shutdown();
 		document.body.removeClass("vault-crdt-show-cursors");
 		this.teardownSync();
 	}
@@ -1365,6 +2054,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			`Host: ${this.settings.host || "(not set)"}`,
 			`Vault ID: ${this.settings.vaultId || "(not set)"}`,
 			`Device: ${this.settings.deviceName || "(unnamed)"}`,
+			`Trace ID: ${this.getTraceHttpContext()?.traceId ?? "(disabled)"}`,
+			`Boot ID: ${this.getTraceHttpContext()?.bootId ?? "(disabled)"}`,
 			`Connected: ${this.vaultSync.connected}`,
 			`Local ready: ${this.vaultSync.localReady}`,
 			`Provider synced: ${this.vaultSync.providerSynced}`,
@@ -1386,8 +2077,169 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				`Pending downloads: ${this.blobSync.pendingDownloads}`,
 			] : []),
 			`Open files: ${this.openFilePaths.size}`,
+			`Server trace events: ${this.recentServerTrace.length}`,
 			`Remote cursors: ${this.settings.showRemoteCursors ? "shown" : "hidden"}`,
 		].join("\n");
+	}
+
+	private buildRecentEventsText(limit = 80): string {
+		const mainEvents = this.eventRing.slice(-limit).map((e) => `[plugin] ${e.ts} ${e.msg}`);
+		const syncEvents = this.vaultSync?.getRecentEvents(limit).map((e) => `[sync]   ${e.ts} ${e.msg}`) ?? [];
+		const serverEvents = this.recentServerTrace
+			.slice(-limit)
+			.map((e) => {
+				const entry = e as { ts?: string; event?: string; deviceName?: string; traceId?: string };
+				return `[server] ${entry.ts ?? ""} ${entry.event ?? "event"}${entry.deviceName ? ` device=${entry.deviceName}` : ""}${entry.traceId ? ` trace=${entry.traceId}` : ""}`;
+			});
+		const merged = [...mainEvents, ...syncEvents, ...serverEvents].sort();
+		if (merged.length === 0) return "No events recorded yet.";
+		return merged.slice(-limit).join("\n");
+	}
+
+	private async sha256Hex(text: string): Promise<string> {
+		const data = new TextEncoder().encode(text);
+		const digest = await crypto.subtle.digest("SHA-256", data);
+		return Array.from(new Uint8Array(digest))
+			.map((b) => b.toString(16).padStart(2, "0"))
+			.join("");
+	}
+
+	private async exportDiagnostics(): Promise<void> {
+		if (!this.vaultSync) {
+			new Notice("Sync not initialized");
+			return;
+		}
+
+		new Notice("Exporting sync diagnostics...");
+		const startedAt = Date.now();
+
+		const diskFiles = this.app.vault.getMarkdownFiles()
+			.filter((f) => isMarkdownSyncable(f.path, this.excludePatterns));
+
+		const crdtPaths = new Set<string>();
+		this.vaultSync.pathToId.forEach((_id, path) => {
+			if (isMarkdownSyncable(path, this.excludePatterns)) {
+				crdtPaths.add(path);
+			}
+		});
+
+		const diskHashes = new Map<string, { hash: string; length: number }>();
+		for (const file of diskFiles) {
+			try {
+				const content = await this.app.vault.read(file);
+				diskHashes.set(file.path, {
+					hash: await this.sha256Hex(content),
+					length: content.length,
+				});
+			} catch (err) {
+				this.log(`diagnostics: failed to read disk file "${file.path}": ${String(err)}`);
+			}
+		}
+
+		const crdtHashes = new Map<string, { hash: string; length: number }>();
+		for (const path of crdtPaths) {
+			const ytext = this.vaultSync.getTextForPath(path);
+			if (!ytext) continue;
+			const content = ytext.toString();
+			crdtHashes.set(path, {
+				hash: await this.sha256Hex(content),
+				length: content.length,
+			});
+		}
+
+		const allPaths = new Set<string>([
+			...Array.from(diskHashes.keys()),
+			...Array.from(crdtHashes.keys()),
+		]);
+
+		const missingOnDisk: string[] = [];
+		const missingInCrdt: string[] = [];
+		const hashMismatches: Array<{ path: string; diskHash: string; crdtHash: string; diskLength: number; crdtLength: number }> = [];
+
+		for (const path of allPaths) {
+			const disk = diskHashes.get(path);
+			const crdt = crdtHashes.get(path);
+			if (!disk && crdt) {
+				missingOnDisk.push(path);
+				continue;
+			}
+			if (disk && !crdt) {
+				missingInCrdt.push(path);
+				continue;
+			}
+			if (disk && crdt && disk.hash !== crdt.hash) {
+				hashMismatches.push({
+					path,
+					diskHash: disk.hash,
+					crdtHash: crdt.hash,
+					diskLength: disk.length,
+					crdtLength: crdt.length,
+				});
+			}
+		}
+
+		const diagnostics = {
+			generatedAt: new Date().toISOString(),
+			generationMs: Date.now() - startedAt,
+			trace: this.getTraceHttpContext() ?? null,
+			settings: {
+				host: this.settings.host,
+				tokenPrefix: this.settings.token ? `${this.settings.token.slice(0, 8)}...` : "",
+				vaultId: this.settings.vaultId,
+				deviceName: this.settings.deviceName,
+				debug: this.settings.debug,
+				enableAttachmentSync: this.settings.enableAttachmentSync,
+				externalEditPolicy: this.settings.externalEditPolicy,
+			},
+			state: {
+				reconciled: this.reconciled,
+				reconcileInFlight: this.reconcileInFlight,
+				reconcilePending: this.reconcilePending,
+				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
+				lastReconciledGeneration: this.lastReconciledGeneration,
+				connected: this.vaultSync.connected,
+				providerSynced: this.vaultSync.providerSynced,
+				localReady: this.vaultSync.localReady,
+				connectionGeneration: this.vaultSync.connectionGeneration,
+				fatalAuthError: this.vaultSync.fatalAuthError,
+				idbError: this.vaultSync.idbError,
+				pathToIdCount: this.vaultSync.pathToId.size,
+				blobPathCount: this.vaultSync.pathToBlob.size,
+				diskFileCount: diskFiles.length,
+				openFileCount: this.openFilePaths.size,
+			},
+			hashDiff: {
+				missingOnDisk,
+				missingInCrdt,
+				hashMismatches,
+				matchingCount: allPaths.size - missingOnDisk.length - missingInCrdt.length - hashMismatches.length,
+				totalCompared: allPaths.size,
+			},
+			recentEvents: {
+				plugin: this.eventRing.slice(-240),
+				sync: this.vaultSync.getRecentEvents(240),
+			},
+			openFiles: await this.collectOpenFileTraceState(),
+			diskMirror: this.diskMirror?.getDebugSnapshot() ?? null,
+			blobSync: this.blobSync?.getDebugSnapshot() ?? null,
+			serverTrace: this.recentServerTrace,
+		};
+
+		const diagDir = normalizePath(`${this.app.vault.configDir}/plugins/vault-crdt-sync/diagnostics`);
+		if (!(await this.app.vault.adapter.exists(diagDir))) {
+			await this.app.vault.adapter.mkdir(diagDir);
+		}
+
+		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+		const fileName = `sync-diagnostics-${stamp}-${this.settings.deviceName || "device"}.json`;
+		const outPath = normalizePath(`${diagDir}/${fileName}`);
+		await this.app.vault.adapter.write(outPath, JSON.stringify(diagnostics, null, 2));
+
+		this.log(
+			`Diagnostics exported: ${outPath} ` +
+			`(missingOnDisk=${missingOnDisk.length}, missingInCrdt=${missingInCrdt.length}, mismatches=${hashMismatches.length})`,
+		);
+		new Notice(`Sync diagnostics exported to ${outPath}`, 10000);
 	}
 
 	// -------------------------------------------------------------------
@@ -1401,7 +2253,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 */
 	private async triggerDailySnapshot(): Promise<void> {
 		try {
-			const result = await requestDailySnapshot(this.settings, this.settings.deviceName);
+			const result = await requestDailySnapshot(
+				this.settings,
+				this.settings.deviceName,
+				this.getTraceHttpContext(),
+			);
 			if (result.status === "created") {
 				this.log(`Daily snapshot created: ${result.snapshotId}`);
 			} else if (result.status === "noop") {
@@ -1422,7 +2278,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		new Notice("Loading snapshots...");
 
 		try {
-			const snapshots = await fetchSnapshotList(this.settings);
+			const snapshots = await fetchSnapshotList(
+				this.settings,
+				this.getTraceHttpContext(),
+			);
 
 			if (snapshots.length === 0) {
 				new Notice("No snapshots found. Take a snapshot first.");
@@ -1447,7 +2306,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		new Notice("Downloading snapshot...");
 
 		try {
-			const snapshotDoc = await downloadSnapshot(this.settings, snapshot);
+			const snapshotDoc = await downloadSnapshot(
+				this.settings,
+				snapshot,
+				this.getTraceHttpContext(),
+			);
 			const diff = diffSnapshot(snapshotDoc, this.vaultSync.ydoc);
 
 			let destroyed = false;
@@ -1501,7 +2364,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 					// Flush restored files to disk
 					for (const path of markdownPaths) {
-						await this.diskMirror?.flushWrite(path);
+						await this.diskMirror?.flushWrite(path, true);
 					}
 
 					// Kick blob downloads for restored blob references
@@ -1514,6 +2377,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 					// Re-bind editors for restored files
 					this.bindAllOpenEditors();
+					this.validateAllOpenBindings("snapshot-restore");
 
 					const parts: string[] = [];
 					if (result.markdownRestored > 0) parts.push(`${result.markdownRestored} files restored`);
@@ -1538,6 +2402,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private log(msg: string): void {
+		this.eventRing.push({ ts: new Date().toISOString(), msg });
+		if (this.eventRing.length > 600) {
+			this.eventRing.splice(0, this.eventRing.length - 600);
+		}
+		this.trace("plugin", msg);
 		if (this.settings.debug) {
 			console.log(`[vault-crdt-sync] ${msg}`);
 		}

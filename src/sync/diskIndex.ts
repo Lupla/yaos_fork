@@ -122,12 +122,13 @@ export function moveIndexEntries(
 }
 
 /**
- * File stability check: wait for a file to stop being written to.
- * Checks stat at intervals; stable when two consecutive checks match.
+ * Give a newly created file a short quiet window before we act on it.
+ * Checks stat at intervals and returns early once two consecutive samples match.
  *
- * Returns true if stable, false if it never stabilized within maxChecks.
+ * Returns true if the file went quiet or remained present through the sampling
+ * budget. Returns false only if the file disappeared while waiting.
  */
-export async function waitForStable(
+export async function waitForDiskQuiet(
 	app: App,
 	path: string,
 	checks = 3,
@@ -150,7 +151,7 @@ export async function waitForStable(
 		}
 	}
 
-	// If we got here after all checks without two matching, treat as stable
-	// (the file was changing every check interval — unusual but not fatal)
+	// If the file never fully quieted during the budget, continue anyway as long
+	// as it still exists. This is a bounded delay, not a hard stability proof.
 	return last !== null;
 }
