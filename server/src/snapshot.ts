@@ -1,76 +1,36 @@
-/**
- * Server-side snapshot creation and management.
- *
- * Snapshots are point-in-time backups of the CRDT state stored in R2.
- * The server encodes the Y.Doc, gzips it, and writes two objects:
- *   - crdt.bin.gz   (gzipped Y.encodeStateAsUpdate)
- *   - index.json    (metadata: vault, timestamp, file/blob counts, referenced blob hashes)
- *
- * R2 key layout:
- *   v1/<vaultId>/snapshots/<YYYY-MM-DD>/<snapshotId>/crdt.bin.gz
- *   v1/<vaultId>/snapshots/<YYYY-MM-DD>/<snapshotId>/index.json
- *
- * Coordination:
- *   - lastSnapshotDay stored in DO room.storage to avoid duplicate daily snapshots.
- *   - /snapshot/maybe checks lastSnapshotDay; /snapshot/now always creates.
- */
-
 import * as Y from "yjs";
 import { gzipSync } from "fflate";
-import type { R2Config } from "./presign";
-import { AwsClient } from "aws4fetch";
-import { XMLParser } from "fast-xml-parser";
 import { mapWithConcurrency } from "./concurrency";
 
-// -------------------------------------------------------------------
-// Types
-// -------------------------------------------------------------------
-
 export interface SnapshotIndex {
-	/** Unique snapshot identifier. */
 	snapshotId: string;
-	/** Vault ID this snapshot belongs to. */
 	vaultId: string;
-	/** ISO 8601 timestamp when the snapshot was created. */
 	createdAt: string;
-	/** Calendar day string (YYYY-MM-DD) for grouping. */
 	day: string;
-	/** Schema version of the CRDT doc at snapshot time. */
 	schemaVersion: number | undefined;
-	/** Number of markdown file paths in pathToId. */
 	markdownFileCount: number;
-	/** Number of blob paths in pathToBlob. */
 	blobFileCount: number;
-	/** Size of the gzipped CRDT binary in bytes. */
 	crdtSizeBytes: number;
-	/** Size of the raw (uncompressed) CRDT update in bytes. */
 	crdtRawSizeBytes: number;
-	/** All blob content hashes referenced by pathToBlob at snapshot time. */
 	referencedBlobHashes: string[];
-	/** Device that triggered the snapshot (if known). */
 	triggeredBy?: string;
 }
 
 export interface SnapshotResult {
 	status: "created" | "noop" | "unavailable";
 	snapshotId?: string;
-	snapshotKey?: string;
 	reason?: string;
 	index?: SnapshotIndex;
 }
 
-// -------------------------------------------------------------------
-// Helpers
-// -------------------------------------------------------------------
-
 const SNAPSHOT_FETCH_CONCURRENCY = 4;
-const r2ListParser = new XMLParser({
-	ignoreAttributes: false,
-	trimValues: false,
-});
 
-function today(): string {
+export function today(): string {
 	return new Date().toISOString().slice(0, 10);
+}
+
+export function blobKey(vaultId: string, hash: string): string {
+	return `v1/${vaultId}/blobs/${hash}`;
 }
 
 function generateSnapshotId(): string {
@@ -85,163 +45,76 @@ function snapshotPrefix(vaultId: string, day: string, snapshotId: string): strin
 	return `v1/${vaultId}/snapshots/${day}/${snapshotId}`;
 }
 
-function r2Endpoint(config: R2Config): string {
-	return `https://${config.accountId}.r2.cloudflarestorage.com`;
+function normalizeBytes(data: ArrayBuffer | ArrayBufferView): Uint8Array {
+	if (data instanceof Uint8Array) {
+		return data;
+	}
+	if (ArrayBuffer.isView(data)) {
+		return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+	}
+	return new Uint8Array(data);
 }
 
-function makeClient(config: R2Config): AwsClient {
-	return new AwsClient({
-		accessKeyId: config.accessKeyId,
-		secretAccessKey: config.secretAccessKey,
-		region: "auto",
-		service: "s3",
+async function listAllKeys(bucket: R2Bucket, prefix: string): Promise<string[]> {
+	const keys: string[] = [];
+	let cursor: string | undefined;
+
+	while (true) {
+		const page = await bucket.list({
+			prefix,
+			limit: 1000,
+			cursor,
+		});
+
+		for (const object of page.objects) {
+			keys.push(object.key);
+		}
+
+		if (!page.truncated) break;
+		cursor = page.cursor;
+	}
+
+	return keys;
+}
+
+export async function hasSnapshotForDay(
+	vaultId: string,
+	day: string,
+	bucket: R2Bucket,
+): Promise<boolean> {
+	const page = await bucket.list({
+		prefix: `v1/${vaultId}/snapshots/${day}/`,
+		limit: 1,
 	});
+	return page.objects.length > 0;
 }
 
-/**
- * PUT an object to R2 using signed request.
- */
-async function r2Put(
-	config: R2Config,
-	key: string,
-	body: Uint8Array | string,
-	contentType: string,
-): Promise<void> {
-	const client = makeClient(config);
-	const url = `${r2Endpoint(config)}/${config.bucketName}/${key}`;
-
-	const bodyBytes = typeof body === "string"
-		? new TextEncoder().encode(body)
-		: body;
-
-	const signed = await client.sign(
-		new Request(url, {
-			method: "PUT",
-			headers: {
-				"Content-Type": contentType,
-				"Content-Length": String(bodyBytes.byteLength),
-			},
-			body: bodyBytes,
-		}),
-	);
-
-	const res = await fetch(signed);
-	if (!res.ok) {
-		const text = await res.text();
-		throw new Error(`R2 PUT failed (${res.status}): ${text}`);
-	}
-}
-
-/**
- * List objects under a given prefix in R2.
- * Returns the keys found.
- */
-async function r2List(
-	config: R2Config,
-	prefix: string,
-	maxKeys = 1000,
-): Promise<string[]> {
-	const client = makeClient(config);
-	const url = new URL(`${r2Endpoint(config)}/${config.bucketName}`);
-	url.searchParams.set("list-type", "2");
-	url.searchParams.set("prefix", prefix);
-	url.searchParams.set("max-keys", String(maxKeys));
-
-	const signed = await client.sign(
-		new Request(url.toString(), { method: "GET" }),
-	);
-
-	const res = await fetch(signed);
-	if (!res.ok) {
-		throw new Error(`R2 LIST failed (${res.status})`);
-	}
-
-	const xml = await res.text();
-	const parsed = r2ListParser.parse(xml) as {
-		ListBucketResult?: {
-			Contents?: { Key?: string } | Array<{ Key?: string }>;
-		};
-	};
-	const contents = parsed.ListBucketResult?.Contents;
-	const entries = Array.isArray(contents)
-		? contents
-		: contents
-		? [contents]
-		: [];
-
-	return entries
-		.map((entry) => entry.Key)
-		.filter((key): key is string => typeof key === "string");
-}
-
-/**
- * GET an object from R2 as bytes.
- */
-async function r2Get(
-	config: R2Config,
-	key: string,
-): Promise<Uint8Array> {
-	const client = makeClient(config);
-	const url = `${r2Endpoint(config)}/${config.bucketName}/${key}`;
-
-	const signed = await client.sign(
-		new Request(url, { method: "GET" }),
-	);
-
-	const res = await fetch(signed);
-	if (!res.ok) {
-		throw new Error(`R2 GET failed (${res.status})`);
-	}
-
-	return new Uint8Array(await res.arrayBuffer());
-}
-
-// -------------------------------------------------------------------
-// Core snapshot creation
-// -------------------------------------------------------------------
-
-/**
- * Create a snapshot from the given Y.Doc and write it to R2.
- *
- * @param ydoc - The live Y.Doc (must be fully loaded/synced)
- * @param vaultId - Vault identifier
- * @param r2 - R2 configuration
- * @param triggeredBy - Optional device name that triggered the snapshot
- * @returns The snapshot index
- */
 export async function createSnapshot(
 	ydoc: Y.Doc,
 	vaultId: string,
-	r2: R2Config,
+	bucket: R2Bucket,
 	triggeredBy?: string,
 ): Promise<SnapshotIndex> {
 	const day = today();
 	const snapshotId = generateSnapshotId();
 	const prefix = snapshotPrefix(vaultId, day, snapshotId);
 
-	// 1. Encode the full Y.Doc state
 	const rawUpdate = Y.encodeStateAsUpdate(ydoc);
-
-	// 2. Gzip it
 	const compressed = gzipSync(rawUpdate);
 
-	// 3. Extract metadata from the doc's maps
 	const pathToId = ydoc.getMap<string>("pathToId");
 	const pathToBlob = ydoc.getMap<unknown>("pathToBlob");
 	const sys = ydoc.getMap<unknown>("sys");
 
-	// Collect referenced blob hashes
 	const referencedBlobHashes: string[] = [];
 	pathToBlob.forEach((ref: unknown) => {
-		if (ref && typeof ref === "object" && "hash" in ref) {
-			const hash = (ref as { hash: string }).hash;
-			if (typeof hash === "string") {
-				referencedBlobHashes.push(hash);
-			}
+		if (!ref || typeof ref !== "object" || !("hash" in ref)) return;
+		const hash = (ref as { hash?: unknown }).hash;
+		if (typeof hash === "string") {
+			referencedBlobHashes.push(hash);
 		}
 	});
 
-	// 4. Build the index
 	const index: SnapshotIndex = {
 		snapshotId,
 		vaultId,
@@ -256,40 +129,37 @@ export async function createSnapshot(
 		triggeredBy,
 	};
 
-	// 5. Write both objects to R2
 	await Promise.all([
-		r2Put(r2, `${prefix}/crdt.bin.gz`, compressed, "application/gzip"),
-		r2Put(r2, `${prefix}/index.json`, JSON.stringify(index), "application/json"),
+		bucket.put(`${prefix}/crdt.bin.gz`, compressed, {
+			httpMetadata: {
+				contentType: "application/gzip",
+			},
+		}),
+		bucket.put(`${prefix}/index.json`, JSON.stringify(index), {
+			httpMetadata: {
+				contentType: "application/json",
+			},
+		}),
 	]);
 
 	return index;
 }
 
-// -------------------------------------------------------------------
-// Snapshot listing
-// -------------------------------------------------------------------
-
-/**
- * List all snapshot indexes for a vault.
- * Returns parsed SnapshotIndex objects sorted by creation date (newest first).
- */
 export async function listSnapshots(
 	vaultId: string,
-	r2: R2Config,
+	bucket: R2Bucket,
 ): Promise<SnapshotIndex[]> {
-	const prefix = `v1/${vaultId}/snapshots/`;
-	const keys = await r2List(r2, prefix);
-
-	// Filter for index.json files only
-	const indexKeys = keys.filter((k) => k.endsWith("/index.json"));
+	const keys = await listAllKeys(bucket, `v1/${vaultId}/snapshots/`);
+	const indexKeys = keys.filter((key) => key.endsWith("/index.json"));
 
 	const indexes = await mapWithConcurrency(
 		indexKeys,
 		SNAPSHOT_FETCH_CONCURRENCY,
 		async (key) => {
 			try {
-				const data = await r2Get(r2, key);
-				const text = new TextDecoder().decode(data);
+				const object = await bucket.get(key);
+				if (!object) return null;
+				const text = await object.text();
 				return JSON.parse(text) as SnapshotIndex;
 			} catch {
 				return null;
@@ -297,33 +167,28 @@ export async function listSnapshots(
 		},
 	);
 
-	// Filter nulls and sort newest first
 	return indexes
-		.filter((idx): idx is SnapshotIndex => idx !== null)
+		.filter((index): index is SnapshotIndex => index !== null)
 		.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
-/**
- * Presign a GET URL for the crdt.bin.gz of a specific snapshot.
- * Used by the plugin to download snapshot data for restore.
- */
-export async function presignSnapshotGet(
+export async function getSnapshotPayload(
 	vaultId: string,
 	snapshotId: string,
-	day: string,
-	r2: R2Config,
-): Promise<{ url: string; expiresIn: number }> {
-	const key = `${snapshotPrefix(vaultId, day, snapshotId)}/crdt.bin.gz`;
-	const client = makeClient(r2);
-	const objectUrl = `${r2Endpoint(r2)}/${r2.bucketName}/${key}`;
+	bucket: R2Bucket,
+): Promise<{ index: SnapshotIndex; payload: Uint8Array } | null> {
+	const snapshots = await listSnapshots(vaultId, bucket);
+	const index = snapshots.find((entry) => entry.snapshotId === snapshotId);
+	if (!index) return null;
 
-	const url = new URL(objectUrl);
-	url.searchParams.set("X-Amz-Expires", "900");
-
-	const signed = await client.sign(
-		new Request(url.toString(), { method: "GET" }),
-		{ aws: { signQuery: true } },
+	const object = await bucket.get(
+		`${snapshotPrefix(vaultId, index.day, snapshotId)}/crdt.bin.gz`,
 	);
+	if (!object) return null;
 
-	return { url: signed.url, expiresIn: 900 };
+	const body = await object.arrayBuffer();
+	return {
+		index,
+		payload: normalizeBytes(body),
+	};
 }
