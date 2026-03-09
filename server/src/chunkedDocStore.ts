@@ -1,4 +1,5 @@
 import * as Y from "yjs";
+import { sha256Hex } from "./hex";
 
 const CHECKPOINT_FORMAT = "yaos-doc-checkpoint-v2";
 const JOURNAL_META_FORMAT = "yaos-doc-journal-v1";
@@ -177,13 +178,6 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
 		out.push(arr.slice(i, i + size));
 	}
 	return out;
-}
-
-async function sha256Hex(bytes: Uint8Array): Promise<string> {
-	const digest = await crypto.subtle.digest("SHA-256", bytes);
-	return Array.from(new Uint8Array(digest))
-		.map((value) => value.toString(16).padStart(2, "0"))
-		.join("");
 }
 
 async function getManyBatched<T>(

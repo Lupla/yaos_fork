@@ -1,6 +1,7 @@
 import { getServerByName } from "partyserver";
 import * as Y from "yjs";
 import { mapWithConcurrency } from "./concurrency";
+import { sha256Hex } from "./hex";
 import { ServerConfig, type StoredServerConfig } from "./config";
 import {
 	blobKey,
@@ -167,10 +168,7 @@ function rejectSocket(
 
 async function hashToken(token: string): Promise<string> {
 	const bytes = new TextEncoder().encode(token);
-	const digest = await crypto.subtle.digest("SHA-256", bytes);
-	return Array.from(new Uint8Array(digest))
-		.map((value) => value.toString(16).padStart(2, "0"))
-		.join("");
+	return sha256Hex(bytes);
 }
 
 function supportsBuckets(env: Env): boolean {
