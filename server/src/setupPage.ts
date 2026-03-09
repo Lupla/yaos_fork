@@ -618,12 +618,15 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 <body>
   <main class="card">
     <h1>Connect YAOS</h1>
-    <p>Tap below to open Obsidian and link this vault to <strong>${safeHost}</strong>.</p>
+    <p>Link this phone to <strong>${safeHost}</strong> in two steps.</p>
 
     <a id="connect-button" class="cta" href="#" aria-disabled="true">Connect Obsidian</a>
     <div id="status" class="status">Loading setup data...</div>
     <div class="recovery">
       <p>Don't have YAOS installed on this phone yet?</p>
+      <p style="margin-top: 6px;">1. Open BRAT in Obsidian.</p>
+      <p style="margin-top: 4px;">2. Add repo <code style="font-size:12px;">kavinsood/yaos</code>.</p>
+      <p style="margin-top: 4px; margin-bottom: 10px;">3. Enable YAOS, then come back and tap <strong>Connect Obsidian</strong>.</p>
       <div class="row">
         <a class="ghost" href="obsidian://show-plugin?id=obsidian42-brat">Open BRAT</a>
         <button id="copy-repo" class="ghost" type="button">Copy repo slug</button>
@@ -680,13 +683,7 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
       // Scrub the URL history to hide the token fragment immediately
       window.history.replaceState(null, "", window.location.pathname);
 
-      statusEl.textContent = "Opening Obsidian...";
-
-      // Attempt auto-redirect, allowing a small delay for UI paint
-      setTimeout(() => {
-        window.location.href = deepLink;
-        statusEl.textContent = "If Obsidian didn't open, tap the button above.";
-      }, 300);
+      statusEl.textContent = "Ready. Install YAOS via BRAT if needed, then tap Connect Obsidian.";
     }
 
     copyRepoBtn.addEventListener("click", async () => {
