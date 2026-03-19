@@ -2579,6 +2579,27 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 	}
 
+	private async confirmVaultIdSwitch(
+		currentVaultId: string,
+		incomingVaultId: string,
+		localMarkdownCount: number,
+	): Promise<boolean> {
+		return await new Promise((resolve) => {
+			new ConfirmModal(
+				this.app,
+				"Switch vault ID",
+				`YAOS pairing link points to a different vault ID. ` +
+				`Current vault ID: ${currentVaultId}. Incoming vault ID: ${incomingVaultId}. ` +
+				`This vault currently has ${localMarkdownCount} local markdown files. ` +
+				`Switching rooms may pull a different remote state. Continue and switch to the incoming vault ID?`,
+				() => resolve(true),
+				"Switch vault ID",
+				"Keep current vault ID",
+				() => resolve(false),
+			).open();
+		});
+	}
+
 	private async handleSetupLink(params: Record<string, string>): Promise<void> {
 		const host = typeof params.host === "string" ? params.host.trim() : "";
 		const token = typeof params.token === "string" ? params.token.trim() : "";
@@ -2601,13 +2622,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				.filter((file) => this.isMarkdownPathSyncable(file.path))
 				.length;
 			if (localMarkdownCount > 5) {
-				const confirmed = window.confirm(
-					`YAOS pairing link points to a different Vault ID.\n\n` +
-					`Current: ${currentVaultId}\n` +
-					`Incoming: ${incomingVaultId}\n\n` +
-					`This vault currently has ${localMarkdownCount} local markdown files. ` +
-					`Switching rooms may pull a different remote state.\n\n` +
-					`Continue and switch to the incoming Vault ID?`,
+				const confirmed = await this.confirmVaultIdSwitch(
+					currentVaultId,
+					incomingVaultId,
+					localMarkdownCount,
 				);
 				if (!confirmed) {
 					new Notice("YAOS: pairing cancelled. Vault ID unchanged.", 6000);
@@ -3437,17 +3455,27 @@ class ConfirmModal extends Modal {
 	private title: string;
 	private message: string;
 	private onConfirm: () => void | Promise<void>;
+	private confirmText: string;
+	private cancelText: string;
+	private onCancel?: () => void | Promise<void>;
+	private confirmed = false;
 
 	constructor(
 		app: import("obsidian").App,
 		title: string,
 		message: string,
 		onConfirm: () => void | Promise<void>,
+		confirmText = "Confirm",
+		cancelText = "Cancel",
+		onCancel?: () => void | Promise<void>,
 	) {
 		super(app);
 		this.title = title;
 		this.message = message;
 		this.onConfirm = onConfirm;
+		this.confirmText = confirmText;
+		this.cancelText = cancelText;
+		this.onCancel = onCancel;
 	}
 
 	onOpen() {
@@ -3460,14 +3488,15 @@ class ConfirmModal extends Modal {
 		const buttonRow = contentEl.createDiv({ cls: "modal-button-container" });
 
 		buttonRow
-			.createEl("button", { text: "Cancel" })
+			.createEl("button", { text: this.cancelText })
 			.addEventListener("click", () => this.close());
 
 		const confirmBtn = buttonRow.createEl("button", {
-			text: "Confirm",
+			text: this.confirmText,
 			cls: "mod-warning",
 		});
 		confirmBtn.addEventListener("click", () => {
+			this.confirmed = true;
 			this.close();
 			void this.onConfirm();
 		});
@@ -3475,6 +3504,9 @@ class ConfirmModal extends Modal {
 
 	onClose() {
 		this.contentEl.empty();
+		if (!this.confirmed && this.onCancel) {
+			void this.onCancel();
+		}
 	}
 }
 
