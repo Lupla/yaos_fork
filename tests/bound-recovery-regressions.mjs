@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import * as Y from "yjs";
 
 const diffModule = await import("../src/sync/diff.ts");
@@ -70,17 +69,40 @@ console.log("\n--- Test 1: bound-file recovery applies one content authority ---
 	oldAmplifier.doc.destroy();
 }
 
-console.log("\n--- Test 2: local-only recovery branch uses non-writing repair ---");
+console.log("\n--- Test 2: repeated disk-authority recovery does not amplify stale editor state ---");
 {
-	const mainSource = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
-	const localOnlyStart = mainSource.indexOf("const localOnlyViews = viewStates.filter");
-	const crdtOnlyStart = mainSource.indexOf("const crdtOnlyViews = viewStates.filter");
-	const branch = mainSource.slice(localOnlyStart, crdtOnlyStart);
+	const crdt = [
+		"---",
+		"timeEstimate: 2",
+		"kind: op",
+		"---",
+		"",
+	].join("\n");
+	const disk = [
+		"---",
+		"timeEstimate: 20",
+		"kind: op",
+		"---",
+		"",
+	].join("\n");
+	const staleEditor = [
+		"---",
+		"timeEstimate: 200",
+		"kind: op",
+		"---",
+		"",
+	].join("\n");
 
-	assert(localOnlyStart > -1 && crdtOnlyStart > localOnlyStart, "local-only recovery branch found");
-	assert(branch.includes("editorBindings?.repair("), "local-only recovery repairs binding without content heal");
-	assert(!branch.includes("editorBindings?.heal("), "local-only recovery does not call content-writing heal");
-	assert(branch.includes('"disk-sync-recover-bound"'), "local-only recovery still applies disk-selected CRDT diff");
+	const state = makeText(crdt);
+	for (let i = 0; i < 5; i++) {
+		const before = state.ytext.toString();
+		applyDiffToYText(state.ytext, before, disk, "disk-sync-recover-bound");
+	}
+
+	assert(state.ytext.toString() === disk, "repeated disk-authority recovery stays at disk content");
+	assert(state.ytext.toString() !== staleEditor, "stale editor content is not reapplied during repair-only recovery");
+	assert(state.ytext.toString().length === disk.length, "repeated repair-only recovery does not grow content");
+	state.doc.destroy();
 }
 
 console.log(`\n${"-".repeat(50)}`);

@@ -9,6 +9,7 @@ import { formatUnknown, yTextToString } from "../utils/format";
 import {
 	isFrontmatterBlocked,
 	validateFrontmatterTransition,
+	type FrontmatterValidationResult,
 } from "./frontmatterGuard";
 
 /**
@@ -102,6 +103,12 @@ export class DiskMirror {
 		private editorBindings: EditorBindingManager,
 		debug: boolean,
 		private trace?: TraceRecord,
+		private frontmatterGuardEnabled: () => boolean = () => true,
+		private onFrontmatterBlocked?: (
+			path: string,
+			direction: "crdt-to-disk",
+			validation: FrontmatterValidationResult,
+		) => void,
 	) {
 		this.debug = debug;
 	}
@@ -479,6 +486,8 @@ export class DiskMirror {
 		previousContent: string | null,
 		nextContent: string,
 	): boolean {
+		if (!this.frontmatterGuardEnabled()) return false;
+
 		const validation = validateFrontmatterTransition(previousContent, nextContent);
 		if (!isFrontmatterBlocked(validation)) return false;
 
@@ -497,6 +506,7 @@ export class DiskMirror {
 			`frontmatter write blocked for "${path}" ` +
 			`(${validation.reasons.join(", ") || validation.risk})`,
 		);
+		this.onFrontmatterBlocked?.(path, "crdt-to-disk", validation);
 		return true;
 	}
 

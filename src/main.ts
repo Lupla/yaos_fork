@@ -87,6 +87,7 @@ const FAST_RECONNECT_MIN_INTERVAL_MS = 2_000;
 const MARKDOWN_DIRTY_SETTLE_MS = 350;
 const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
 const BOUND_RECOVERY_LOCK_MS = 1500;
+const FRONTMATTER_GUARD_NOTICE_MS = 30_000;
 const CAPABILITY_REFRESH_INTERVAL_MS = 30_000;
 const UPDATE_MANIFEST_URLS = [
 	"https://github.com/kavinsood/yaos/releases/latest/download/update-manifest.json",
@@ -284,6 +285,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private legacyServerNoticeShown = false;
 	private commandsRegistered = false;
 	private idbDegradedHandled = false;
+	private frontmatterGuardNoticeAt = new Map<string, number>();
 
 	/**
 	 * True when startup timed out waiting for provider sync.
@@ -446,6 +448,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.editorBindings,
 				this.settings.debug,
 				(source, msg, details) => this.trace(source, msg, details),
+				() => this.settings.frontmatterGuardEnabled,
+				(path, direction) => this.showFrontmatterGuardNotice(path, direction),
 			);
 			this.diskMirror.startMapObservers();
 
@@ -2160,6 +2164,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		nextContent: string,
 		reason: string,
 	): boolean {
+		if (!this.settings.frontmatterGuardEnabled) return false;
+
 		const validation = validateFrontmatterTransition(previousContent, nextContent);
 		if (!isFrontmatterBlocked(validation)) return false;
 
@@ -2175,7 +2181,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			`Frontmatter ingest blocked for "${path}" ` +
 			`(${validation.reasons.join(", ") || validation.risk})`,
 		);
+		this.showFrontmatterGuardNotice(path, "disk-to-crdt");
 		return true;
+	}
+
+	private showFrontmatterGuardNotice(
+		path: string,
+		direction: "disk-to-crdt" | "crdt-to-disk",
+	): void {
+		const key = `${direction}:${path}`;
+		const now = Date.now();
+		if ((this.frontmatterGuardNoticeAt.get(key) ?? 0) + FRONTMATTER_GUARD_NOTICE_MS > now) {
+			return;
+		}
+
+		this.frontmatterGuardNoticeAt.set(key, now);
+		new Notice(
+			`YAOS paused a properties update in "${path}" because the frontmatter looked unsafe. Check diagnostics before accepting the change.`,
+			12_000,
+		);
 	}
 
 	private traceFrontmatterQuarantine(

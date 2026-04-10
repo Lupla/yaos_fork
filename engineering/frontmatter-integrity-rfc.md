@@ -13,11 +13,18 @@ It is intentionally grounded in the 2026-04-09 incident logs:
 
 ## Status
 
-P0 and the first P1 containment pass are implemented.
+P0 and the first P1 containment pass are implemented:
+
+- bound-file recovery now uses non-writing binding repair after disk-authority
+  recovery
+- the frontmatter guard blocks obvious duplicate/malformed/growth-burst states
+  in both disk-to-CRDT and CRDT-to-disk directions
+- blocked transitions are traced, surfaced with a throttled user notice, and can
+  be opted out from Advanced settings for troubleshooting
 
 Still proposed:
 
-- persisted quarantine state and user-facing recovery UI
+- persisted quarantine state and full recovery UI
 - structure-aware frontmatter sidecar
 - canonical YAML rendering
 
@@ -271,9 +278,15 @@ The extractor should return:
 This does not require parsing YAML yet. It is a cheap structural boundary for
 guards and diagnostics.
 
-### 5. Add YAML parse validation
+### 5. Add frontmatter validation
 
-Use a real YAML parser rather than ad hoc string manipulation.
+The first containment pass uses a cheap structural classifier. It blocks only
+obvious hazards such as duplicate top-level keys, repeated bare-key bursts,
+malformed frontmatter fences, and isolated frontmatter growth bursts.
+
+That first pass is an emergency brake, not a complete YAML policy. The durable
+implementation should use a real YAML parser rather than ad hoc string
+manipulation.
 
 The validator should detect:
 
@@ -305,7 +318,7 @@ For `block`, YAOS should:
 
 - leave body sync available when the body can be separated safely
 - record a diagnostic
-- optionally notify the user with short copy
+- notify the user with short copy
 
 ### 7. Gate outbound CRDT-to-disk frontmatter writes
 
@@ -339,7 +352,9 @@ The quarantine should be clearable when:
 - the user chooses the local disk state
 - the user disables the guard for the path
 
-The first implementation can be trace-only plus skip behavior. UI can follow.
+The first implementation is skip behavior plus trace/log diagnostics, a
+throttled notice, and a global opt-out. Persisted per-file quarantine state and
+explicit accept/keep recovery controls should follow.
 
 ## P2: Structure-aware frontmatter sync
 
