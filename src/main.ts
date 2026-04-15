@@ -22,6 +22,7 @@ import {
 } from "./update/updateManifest";
 import { isMarkdownSyncable, isBlobSyncable } from "./types";
 import { applyDiffToYText } from "./sync/diff";
+import { decideExternalEditImport } from "./sync/externalEditPolicy";
 import {
 	isFrontmatterBlocked,
 	validateFrontmatterTransition,
@@ -248,6 +249,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private pendingStabilityChecks = new Set<string>();
 	/** Coalesced markdown disk events awaiting import into CRDT. */
 	private dirtyMarkdownPaths = new Map<string, "create" | "modify">();
+	private closedOnlyDeferredImports = new Set<string>();
 	private markdownDrainPromise: Promise<void> | null = null;
 	private markdownDrainTimer: ReturnType<typeof setTimeout> | null = null;
 	private lastMarkdownDirtyAt = 0;
@@ -293,6 +295,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private legacyServerNoticeShown = false;
 	private commandsRegistered = false;
 	private idbDegradedHandled = false;
+	private lastMetadataRaceRejectionAt = 0;
 	private frontmatterGuardNoticeFingerprints = new Map<string, string>();
 	private frontmatterQuarantineEntries: FrontmatterQuarantineEntry[] = [];
 
@@ -1179,6 +1182,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.openFilePaths.add(path);
 		}
 
+		this.reconcileTrackedOpenFiles("track-open-file");
+		this.scheduleTraceStateSnapshot("track-open-file");
+	}
+
+	private reconcileTrackedOpenFiles(reason: string): void {
 		// Scan all leaves to find which files are actually still open
 		const currentlyOpen = new Set<string>();
 		this.app.workspace.iterateAllLeaves((leaf) => {
@@ -1192,10 +1200,37 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			if (!currentlyOpen.has(tracked)) {
 				this.diskMirror?.notifyFileClosed(tracked);
 				this.openFilePaths.delete(tracked);
-				this.log(`Closed observer for "${tracked}" (no longer open)`);
+				this.log(`${reason}: closed observer for "${tracked}"`);
+				this.maybeImportDeferredClosedOnlyPath(tracked, reason);
 			}
 		}
-		this.scheduleTraceStateSnapshot("track-open-file");
+	}
+
+	private maybeImportDeferredClosedOnlyPath(path: string, reason: string): void {
+		if (!this.reconciled) return;
+		if (this.settings.externalEditPolicy !== "closed-only") return;
+		if (!this.isMarkdownPathSyncable(path)) return;
+		if (this.closedOnlyDeferredImports.has(path)) return;
+		if (this.getOpenMarkdownViewsForPath(path).length > 0) return;
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) return;
+
+		this.closedOnlyDeferredImports.add(path);
+		this.trace("trace", "closed-only-deferred-import-queued", {
+			path,
+			reason,
+		});
+
+		void this.processDirtyMarkdownPath(path, "modify")
+			.catch((err) => {
+				console.error(
+					`[yaos] closed-only deferred import failed for "${path}" (${reason}):`,
+					err,
+				);
+			})
+			.finally(() => {
+				this.closedOnlyDeferredImports.delete(path);
+			});
 	}
 
 	private getActiveMarkdownPath(): string | null {
@@ -1225,19 +1260,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.app.workspace.on("layout-change", () => {
 				if (!this.reconciled) return;
 				this.editorBindings?.clearLocalCursor("layout-change");
-				const currentlyOpen = new Set<string>();
-				this.app.workspace.iterateAllLeaves((leaf) => {
-					if (leaf.view instanceof MarkdownView && leaf.view.file) {
-						currentlyOpen.add(leaf.view.file.path);
-					}
-				});
-				for (const tracked of this.openFilePaths) {
-					if (!currentlyOpen.has(tracked)) {
-						this.diskMirror?.notifyFileClosed(tracked);
-						this.openFilePaths.delete(tracked);
-						this.log(`layout-change: closed observer for "${tracked}"`);
-					}
-				}
+				this.reconcileTrackedOpenFiles("layout-change");
 				this.updateActiveMarkdownPath(
 					this.getActiveMarkdownPath(),
 					"layout-change-active-blur",
@@ -1256,6 +1279,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				const nextPath =
 					leaf?.view instanceof MarkdownView ? (leaf.view.file?.path ?? null) : null;
 				this.updateActiveMarkdownPath(nextPath, "active-leaf-change");
+				this.reconcileTrackedOpenFiles("active-leaf-change");
 				if (!leaf) return;
 				const view = leaf.view;
 				if (view instanceof MarkdownView) {
@@ -1865,13 +1889,30 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (!this.vaultSync) return;
 		if (!this.isMarkdownPathSyncable(file.path)) return;
 
-		const wasBound = this.editorBindings?.isBound(file.path) ?? false;
+		let wasBound = this.editorBindings?.isBound(file.path) ?? false;
+		const openViews = this.getOpenMarkdownViewsForPath(file.path);
+		const isOpenInEditor = openViews.length > 0;
+		if (wasBound && !isOpenInEditor) {
+			this.trace("trace", "stale-bound-path-without-open-view", {
+				path: file.path,
+			});
+			this.editorBindings?.unbindByPath(file.path);
+			this.log(`syncFileFromDisk: cleared stale bound state for "${file.path}" (no live view)`);
+			wasBound = false;
+		}
 
-		// External edit policy gate: control whether disk changes to
-		// *closed* files are imported into the CRDT.
+		// External edit policy gate: control whether disk changes are
+		// imported into the CRDT.
 		const policy = this.settings.externalEditPolicy;
-		if (!wasBound && policy === "never") {
-			this.log(`syncFileFromDisk: skipping "${file.path}" (external edit policy: never)`);
+		const policyDecision = decideExternalEditImport(policy, isOpenInEditor);
+		if (!policyDecision.allowImport) {
+			const reason = policyDecision.reason === "policy-never"
+				? "external edit policy: never"
+				: "external edit policy: closed-only (file is open; deferred)";
+			this.log(`syncFileFromDisk: skipping "${file.path}" (${reason})`);
+			if (policyDecision.reason === "policy-never") {
+				await this.updateDiskIndexForPath(file.path);
+			}
 			return;
 		}
 
@@ -1885,22 +1926,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 			const existingText = this.vaultSync.getTextForPath(file.path);
 
-			if (wasBound) {
+			if (wasBound && isOpenInEditor) {
 				const handledBound = this.handleBoundFileSyncGap(
 					file,
 					content,
 					existingText,
+					openViews,
 				);
 				if (handledBound) {
 					await this.updateDiskIndexForPath(file.path);
 					return;
 				}
-			}
-
-			if (policy === "never") {
-				this.log(`syncFileFromDisk: skipping "${file.path}" (external edit policy: never)`);
-				await this.updateDiskIndexForPath(file.path);
-				return;
 			}
 
 			if (existingText) {
@@ -1967,6 +2003,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		file: TFile,
 		content: string,
 		existingText: ReturnType<VaultSync["getTextForPath"]>,
+		openViews: MarkdownView[] = this.getOpenMarkdownViewsForPath(file.path),
 	): boolean {
 		const now = Date.now();
 		const lockUntil = this.boundRecoveryLocks.get(file.path) ?? 0;
@@ -1978,7 +2015,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.boundRecoveryLocks.delete(file.path);
 		}
 
-		const openViews = this.getOpenMarkdownViewsForPath(file.path);
 		if (openViews.length === 0) {
 			this.trace("trace", "stale-bound-path-without-open-view", {
 				path: file.path,
@@ -2218,8 +2254,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		const noticeFingerprint = this.buildFrontmatterNoticeFingerprint(
 			validation,
-			previousContent,
-			nextContent,
 		);
 		const shouldNotify = this.shouldNotifyFrontmatterQuarantine(
 			path,
@@ -2259,16 +2293,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private buildFrontmatterNoticeFingerprint(
 		validation: FrontmatterValidationResult,
-		previousContent: string | null,
-		nextContent: string,
 	): string {
 		const reasons = [...validation.reasons].sort().join("|");
 		return [
 			reasons,
 			String(validation.previousFrontmatterLength ?? "none"),
 			String(validation.frontmatterLength ?? "none"),
-			String(previousContent?.length ?? "none"),
-			String(nextContent.length),
 		].join("#");
 	}
 
@@ -2513,6 +2543,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				});
 				this.handleIndexedDbDegraded("unhandled-rejection", event.reason);
 				this.scheduleTraceStateSnapshot("unhandled-rejection-indexeddb");
+				event.preventDefault();
+				return;
+			}
+			if (this.isObsidianFileMetadataRaceError(event.reason)) {
+				const now = Date.now();
+				if (now - this.lastMetadataRaceRejectionAt >= 5000) {
+					this.lastMetadataRaceRejectionAt = now;
+					this.trace("trace", "unhandled-rejection-file-metadata-race", {
+						reason: String(event.reason),
+					});
+					this.scheduleTraceStateSnapshot("unhandled-rejection-file-metadata-race");
+				}
 				event.preventDefault();
 				return;
 			}
@@ -4370,6 +4412,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			|| haystack.includes("quota exceeded")
 			|| haystack.includes("indexeddb")
 			|| haystack.includes("idb");
+	}
+
+	private isObsidianFileMetadataRaceError(err: unknown): boolean {
+		if (!err) return false;
+		const message =
+			typeof (err as { message?: unknown })?.message === "string"
+				? (err as { message: string }).message
+				: formatUnknown(err);
+		const haystack = message.toLowerCase();
+		return haystack.includes("cannot index file, since it has no obsidian file metadata")
+			|| (haystack.includes("failed to index file") && haystack.includes("no obsidian file metadata"));
 	}
 
 	private handleIndexedDbDegraded(source: string, err?: unknown): void {
